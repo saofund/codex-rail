@@ -792,46 +792,70 @@ fn handle_mouse(
     Ok(false)
 }
 
+// Number of attaches over which we keep teaching the detach key, and the
+// countdown length. codex takes over the whole screen with no room for a
+// persistent status bar, and Ctrl+Z's usual meaning (suspend the job) actively
+// misleads — so we teach it with a short countdown shown right before handing
+// off, long enough to actually read. Once was too easy to miss, so we repeat it
+// for the first few attaches, then stop for good.
+const DETACH_HINT_TIMES: u32 = 10;
+const DETACH_HINT_COUNT: u32 = 4; // counts 4 -> 1, ~4 seconds
+
 // The one thing a new user genuinely cannot discover on their own: once codex
-// takes over the screen there is nothing on it that says how to get back, and
-// Ctrl-Z's usual meaning (suspend the job) actively misleads. codex renders
-// inline with no status bar we can piggy-back on, so we teach the escape once —
-// a full-screen note shown only on the very first attach, then never again
-// (subsequent attaches are instant).
-fn show_detach_hint_once() {
-    let flag = state::data_dir().join(".detach_hint_seen");
-    if flag.exists() {
+// takes over the screen there is nothing on it that says how to get back. We
+// show a full-screen countdown before the first DETACH_HINT_TIMES attaches
+// (tracked in a small counter file), then never again. The per-step delay is
+// overridable via CODEX_RAIL_HINT_MS (the tests set it low to stay fast).
+fn show_detach_hint() {
+    let flag = state::data_dir().join(".detach_hint_count");
+    let shown: u32 = fs::read_to_string(&flag)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    if shown >= DETACH_HINT_TIMES {
         return;
     }
-    let (cols, rows) = terminal::size().unwrap_or((80, 24));
-    let center = |text: &str| cols.saturating_sub(display_width(text) as u16) / 2;
-    let cy = rows / 2;
+    let step = Duration::from_millis(
+        env::var("CODEX_RAIL_HINT_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1000),
+    );
     let l1 = "Attaching to codex \u{2026}";
     let l2 = "Press  Ctrl+Z  any time to come back to rail.";
     let mut out = io::stdout();
-    let _ = execute!(
-        out,
-        Clear(ClearType::All),
-        MoveTo(center(l1), cy.saturating_sub(1)),
-        SetForegroundColor(C_DIM),
-        Print(l1),
-        MoveTo(center(l2), cy + 1),
-        SetForegroundColor(C_ACCENT),
-        SetAttribute(Attribute::Bold),
-        Print(l2),
-        SetAttribute(Attribute::Reset),
-        ResetColor
-    );
-    let _ = out.flush();
-    thread::sleep(Duration::from_millis(1400));
+    for n in (1..=DETACH_HINT_COUNT).rev() {
+        let (cols, rows) = terminal::size().unwrap_or((80, 24));
+        let center = |text: &str| cols.saturating_sub(display_width(text) as u16) / 2;
+        let cy = rows / 2;
+        let l3 = format!("opening in {n} \u{2026}");
+        let _ = execute!(
+            out,
+            Clear(ClearType::All),
+            MoveTo(center(l1), cy.saturating_sub(2)),
+            SetForegroundColor(C_DIM),
+            Print(l1),
+            MoveTo(center(l2), cy),
+            SetForegroundColor(C_ACCENT),
+            SetAttribute(Attribute::Bold),
+            Print(l2),
+            SetAttribute(Attribute::Reset),
+            MoveTo(center(&l3), cy + 2),
+            SetForegroundColor(C_FAINT),
+            Print(&l3),
+            ResetColor
+        );
+        let _ = out.flush();
+        thread::sleep(step);
+    }
     // Clear the note before handing off: codex renders inline (not in an alt
     // screen) and never clears the screen itself, so without this its first
     // output would draw right under the hint instead of on a clean screen.
     let _ = execute!(out, ResetColor, Clear(ClearType::All), MoveTo(0, 0));
     let _ = out.flush();
-    // Best-effort persist — if it fails the hint simply shows again next time.
+    // Count this showing; best-effort — a failure just teaches it again next time.
     let _ = state::ensure_base_dirs();
-    let _ = fs::write(&flag, b"1\n");
+    let _ = fs::write(&flag, format!("{}\n", shown + 1));
 }
 
 fn attach_current(app: &mut App, terminal: &mut TerminalSession) -> Result<()> {
@@ -855,7 +879,7 @@ fn attach_current(app: &mut App, terminal: &mut TerminalSession) -> Result<()> {
     }
 
     terminal.leave()?;
-    show_detach_hint_once();
+    show_detach_hint();
     let result = attach::attach_session(&session);
     terminal.enter_again()?;
     app.invalidate_frame(); // the attach blanked the alt screen — force a full repaint

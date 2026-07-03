@@ -119,8 +119,9 @@ on the bottom line, never inside the composer box.
 Attached session:
 
 - `Ctrl+Z`: detach back to the manager. codex draws over the whole screen with
-  no room for a persistent status bar, so rail shows this hint full-screen on
-  your very first attach — after that, attaches are instant.
+  no room for a persistent status bar, so before each of your first several
+  attaches rail shows a brief full-screen countdown reminding you of this key;
+  after that it stops and attaches are instant.
 - every other key passes through to codex
 
 ## Install

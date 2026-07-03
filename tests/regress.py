@@ -60,6 +60,7 @@ class Manager:
         env = os.environ.copy()
         env.update({"XDG_DATA_HOME": data, "XDG_RUNTIME_DIR": run, "HOME": ROOT + "/home",
                     "CODEX_RAIL_CODEX": FAKE, "TERM": "xterm-256color",
+                    "CODEX_RAIL_HINT_MS": "60",  # 4s detach-hint countdown -> fast in tests
                     "COLUMNS": str(COLS), "LINES": str(ROWS)})
         if codex_home:
             env["CODEX_HOME"] = codex_home

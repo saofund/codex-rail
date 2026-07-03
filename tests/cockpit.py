@@ -75,6 +75,8 @@ class Cockpit:
         env = os.environ.copy()
         env.update({"XDG_DATA_HOME": self.data, "XDG_RUNTIME_DIR": self.run, "HOME": self.home,
                     "CODEX_RAIL_CODEX": self.codex, "TERM": "xterm-256color",
+                    # 4s detach-hint countdown -> fast in tests; override to watch it
+                    "CODEX_RAIL_HINT_MS": os.environ.get("COCKPIT_HINT_MS", "60"),
                     "COLUMNS": str(COLS), "LINES": str(ROWS)})
         self.m, s = pty.openpty()
         fcntl.ioctl(s, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
@@ -525,25 +527,27 @@ def audit(rail, pngdir=None):
     finally:
         c.close()
 
-    # 11) detach hint: the escape is taught once on the first-ever attach (codex
-    #     renders inline with no chrome to hook, so a first-run note is how a new
-    #     user learns Ctrl-Z), then never shown again.
+    # 11) detach hint: a countdown ("opening in N") shown before handoff, repeated
+    #     for the first N attaches then stopped for good. Pre-seed the counter to
+    #     the cap to test the stop without doing 10 real attaches.
     c = Cockpit(rail, codex=FAKE_STREAM).boot()
     try:
-        flag = os.path.join(os.path.dirname(c.jobs), ".detach_hint_seen")
+        flag = os.path.join(os.path.dirname(c.jobs), ".detach_hint_count")
         m0 = c.mark()
-        c.new("hello world")                         # create -> first-ever auto-attach
-        taught = b"come back to rail" in c.raw_since(m0)
-        flagged = os.path.exists(flag)
+        c.new("hello world")                         # create -> first auto-attach
+        raw0 = c.raw_since(m0)
+        taught = b"come back to rail" in raw0 and b"opening in" in raw0  # countdown shown
         snap(c, "11_detach_hint")
         c.key(b"\x1a", 1.0)                           # detach
+        # jump the counter to the cap; the NEXT attach must NOT show the hint
+        with open(flag, "w") as f:
+            f.write("10\n")
         m1 = c.mark()
-        c.goto("hello world"); c.key(b"\r", 2.2)      # attach a SECOND time
-        again = b"come back to rail" in c.raw_since(m1)
+        c.goto("hello world"); c.key(b"\r", 2.2)      # attach again, now capped
+        capped = b"come back to rail" not in c.raw_since(m1)
         c.key(b"\x1a", 0.6)
-        check("detach hint: taught on first attach only",
-              taught and flagged and not again,
-              f"taught={taught} flag={flagged} shown_again={again}")
+        check("detach hint: countdown shown, then stops after the cap",
+              taught and capped, f"taught={taught} stopped_after_cap={capped}")
     finally:
         c.close()
 
