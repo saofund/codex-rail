@@ -72,10 +72,13 @@ Design points:
   recovers it by matching codex's own `session_meta` cwd and start time, so the
   row still shows a live status and codex's latest message instead of a bare path.
 - **Status without guessing.** Activity is read from codex's rollout lifecycle
-  (`task_started` / `task_complete`), falling back to the rollout file's mtime
-  (it grows only while codex is working, never while idle). PTY output timing is
-  deliberately *not* used, because codex's animated TUI would keep every session
-  looking busy.
+  (`task_started` … `task_complete`), tracked incrementally: each refresh scans
+  only the bytes appended since the last one and latches the most recent marker.
+  This matters because codex can work for over a minute writing nothing to the
+  rollout, and a single turn can span far more than any fixed tail window — so a
+  bounded tail-scan or an mtime/last-modified heuristic would read "idle" mid-turn.
+  PTY output timing is deliberately *not* used either, because codex's animated
+  TUI would keep every session looking busy.
 - **Needs input vs Stopped.** *Needs input* means the process is alive but codex
   finished its turn and is waiting for you. *Stopped* means the process has
   exited — it needs a resume, not a reply.

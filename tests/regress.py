@@ -66,6 +66,7 @@ class Manager:
         os.close(s)
         self.screen = pyte.Screen(COLS, ROWS)
         self.stream = pyte.ByteStream(self.screen)
+        self.raw = bytearray()
         self.lock = threading.Lock()
         self.stopped = threading.Event()
         threading.Thread(target=self._drain, daemon=True).start()
@@ -80,7 +81,16 @@ class Manager:
                 except OSError:
                     return
                 with self.lock:
+                    self.raw += chunk
                     self.stream.feed(chunk)
+
+    def mark(self):
+        with self.lock:
+            return len(self.raw)
+
+    def raw_since(self, mark):
+        with self.lock:
+            return bytes(self.raw[mark:])
 
     def send(self, payload, settle=0.4):
         os.write(self.m, payload)
@@ -241,9 +251,90 @@ def test_e():
         mgr.close()
 
 
+# ---- F: Working latches through a silent gap (the mtime bug) ----
+def test_f():
+    print("\n== F: Working status latches through a silent gap ==")
+    sid = "019f25a9-adfd-7b43-a6f7-f3682b46ed54"
+    meta = {"type": "session_meta", "payload": {"session_id": sid, "id": sid, "cwd": "/tmp/cw"}}
+    started = {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "t"}}
+    complete = {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "t",
+                                                 "last_agent_message": "done"}}
+    start = sid_start_secs(sid)
+    data, run, jobs, sp = setup("w1", "worker", cwd="/tmp/cw", created_at=start,
+                                codex_session_id=sid)
+    chome = ROOT + "/ch/sessions/2026/07/03"
+    os.makedirs(chome, exist_ok=True)
+    rp = chome + f"/rollout-2026-07-03T09-48-25-{sid}.jsonl"
+    open(rp, "w").write("".join(json.dumps(x) + "\n" for x in (meta, started)))
+    # Point the session at this rollout.
+    st = json.load(open(sp)); st["codex_rollout_path"] = rp; write_state(sp, st)
+
+    def wcount(mgr):
+        for r in mgr.rows():
+            if "Working" in r:
+                try: return int(r.replace("✻", "").split()[-1])
+                except Exception: return None
+        return None
+
+    mgr = Manager(data, run, codex_home=ROOT + "/ch")
+    try:
+        time.sleep(1.2); c0 = wcount(mgr)
+        time.sleep(8.0); c8 = wcount(mgr)                 # 8s of silence (> old 6s threshold)
+        with open(rp, "a") as f: f.write(json.dumps(complete) + "\n")
+        time.sleep(1.5); cf = wcount(mgr)
+        ok = c0 == 1 and c8 == 1 and cf == 0
+        print(f"   Working: t0={c0} t8s(silent)={c8} after_complete={cf}")
+        print("   ", "PASS" if ok else "FAIL")
+        return ok
+    finally:
+        mgr.close()
+
+
+# ---- G: idle renders emit no full-screen clears (flicker) ----
+def test_g():
+    print("\n== G: idle emits no full-screen clears ==")
+    data, run, jobs, _ = setup("idle", "idle-session", status="exited")
+    mgr = Manager(data, run)
+    try:
+        time.sleep(1.0)
+        mark = mgr.mark()
+        time.sleep(4.0)                                   # ~5 refresh cycles, no interaction
+        chunk = mgr.raw_since(mark)
+        clears = chunk.count(b"\x1b[2J")                  # Clear(ClearType::All)
+        ok = clears == 0
+        print(f"   idle bytes={len(chunk)} full_clears={clears}")
+        print("   ", "PASS" if ok else "FAIL")
+        return ok
+    finally:
+        mgr.close()
+
+
+# ---- H: create -> attach -> detach repaints the list (diff-render round-trip) ----
+def test_h():
+    print("\n== H: attach then detach repaints the manager (no blank screen) ==")
+    data, run, jobs, _ = setup("seed", "seed-session", status="exited")
+    mgr = Manager(data, run)
+    try:
+        # `e` + text creates a session, spawns a real worker (fakecodex), and
+        # auto-attaches. fakecodex prints "tick ..." so we can see the attach.
+        mgr.send(b"e", 0.4); mgr.send(b"tick-test", 0.3); mgr.send(b"\r", 2.5)
+        attached_ok = any("tick" in r for r in mgr.rows())
+        # Ctrl+Z detaches back to the manager, which must fully repaint.
+        mgr.send(b"\x1a", 1.5)
+        rows = mgr.rows()
+        repainted = any("Codex Rail" in r for r in rows) and any("tick-test" in r for r in rows)
+        ok = attached_ok and repainted
+        print(f"   attach showed codex output={attached_ok}  list repainted after detach={repainted}")
+        print("   ", "PASS" if ok else "FAIL")
+        return ok
+    finally:
+        mgr.close(); kill_children(jobs)
+
+
 if __name__ == "__main__":
     results = {}
-    for name, fn in [("A", test_a), ("B", test_b), ("C", test_c), ("D", test_d), ("E", test_e)]:
+    for name, fn in [("A", test_a), ("B", test_b), ("C", test_c), ("D", test_d),
+                     ("E", test_e), ("F", test_f), ("G", test_g), ("H", test_h)]:
         try:
             results[name] = fn()
         except Exception as e:

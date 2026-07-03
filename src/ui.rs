@@ -27,8 +27,9 @@ use std::time::{Duration, Instant};
 const STOP_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
 const EXIT_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
 const REFRESH_INTERVAL: Duration = Duration::from_millis(700);
-const ACTIVITY_IDLE_THRESHOLD_SECS: u64 = 6;
-const ROLLOUT_TAIL_BYTES: u64 = 64 * 1024;
+// Preview tail: enough to contain the last agent_message even when codex writes
+// large events (a single message line can be tens of KB).
+const ROLLOUT_TAIL_BYTES: u64 = 256 * 1024;
 // When recovering a rollout for a session whose worker never captured one, only
 // accept a codex rollout that started within this window of the session's
 // creation. Real prompted sessions start their rollout within seconds; a wide
@@ -65,58 +66,70 @@ enum Activity {
     Waiting,
 }
 
-fn classify_activity(session: &SessionState) -> Activity {
-    // No usable rollout signal (path never captured, or the file vanished)
-    // means there's no turn in flight we can see — treat it as waiting for you
-    // rather than trusting PTY-output timing, which codex's always-animating
-    // TUI keeps "fresh" even while idle (that was the old stuck-on-Working bug).
-    classify_from_rollout(session).unwrap_or(Activity::Waiting)
+// Incremental scan state for one session's rollout. We remember how far into
+// the file we've read and the last turn-lifecycle marker we saw, so each
+// refresh only reads the bytes appended since last time — O(new bytes), not
+// O(file). This is what makes Working detection reliable: a real turn can run
+// for over a minute writing NOTHING to the rollout (codex is generating), and
+// spans far more than any fixed tail window, so neither an mtime heuristic nor
+// a bounded tail-scan can see it. Tracking the last marker across refreshes
+// keeps "Active" latched from task_started until task_complete, silence or not.
+#[derive(Clone)]
+struct Lifecycle {
+    path: String,
+    offset: u64,
+    last: Option<Activity>,
 }
 
-// Best-effort: tail the codex rollout JSONL and read the turn lifecycle.
-// codex writes an `event_msg` with `payload.type = "task_started"` when it
-// begins working on a turn and `"task_complete"` when it finishes and is
-// waiting for the user. Scanning newest-to-oldest, whichever marker we hit
-// first is the current state. Everything here depends on an undocumented,
-// reverse-engineered codex-cli format (verified against cli_version 0.142.5),
-// so any parse failure just falls through to PTY timing instead.
-fn classify_from_rollout(session: &SessionState) -> Option<Activity> {
-    let path = session.codex_rollout_path.as_ref()?;
-    let path = Path::new(path);
-    let tail = read_tail(path)?;
-    for line in tail.lines().rev() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        let event_type = value
-            .get("payload")
-            .and_then(|p| p.get("type"))
-            .and_then(|t| t.as_str());
-        match event_type {
-            Some("task_complete") => return Some(Activity::Waiting),
-            Some("task_started") => return Some(Activity::Active),
-            _ => {}
+// Read the bytes appended to the rollout since we last looked and update the
+// latched lifecycle state. codex writes an `event_msg` with
+// `payload.type = "task_started"` when a turn begins and `"task_complete"` when
+// it finishes; the newest of the two is the current state. Undocumented,
+// reverse-engineered codex-cli format (verified against cli_version 0.142.5).
+fn scan_lifecycle(lc: &mut Lifecycle, path: &str) -> Activity {
+    if lc.path != path {
+        lc.path = path.to_string();
+        lc.offset = 0;
+        lc.last = None;
+    }
+    let Ok(mut file) = fs::File::open(path) else {
+        return lc.last.unwrap_or(Activity::Waiting);
+    };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if len < lc.offset {
+        // File shrank (rotated/truncated) — rescan from the top.
+        lc.offset = 0;
+        lc.last = None;
+    }
+    if len > lc.offset && file.seek(SeekFrom::Start(lc.offset)).is_ok() {
+        let mut buf = Vec::new();
+        if file.read_to_end(&mut buf).is_ok() {
+            // Only consume up to the last complete line; a trailing partial
+            // line (codex mid-write of a big event) is left for next time.
+            if let Some(nl) = buf.iter().rposition(|&b| b == b'\n') {
+                for line in buf[..=nl].split(|&b| b == b'\n') {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
+                        continue;
+                    };
+                    match value
+                        .get("payload")
+                        .and_then(|p| p.get("type"))
+                        .and_then(|t| t.as_str())
+                    {
+                        Some("task_started") => lc.last = Some(Activity::Active),
+                        Some("task_complete") => lc.last = Some(Activity::Waiting),
+                        _ => {}
+                    }
+                }
+                lc.offset += (nl + 1) as u64;
+            }
         }
     }
-    // No lifecycle marker in the tail window — a very long turn can push
-    // task_started past it. Fall back to the rollout's mtime: codex appends
-    // events continuously while it works but writes nothing while idle at the
-    // prompt, so a recently-grown file means Active. Immune to idle TUI redraws.
-    let modified_age = fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.elapsed().ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(u64::MAX);
-    Some(if modified_age <= ACTIVITY_IDLE_THRESHOLD_SECS {
-        Activity::Active
-    } else {
-        Activity::Waiting
-    })
+    // No marker ever seen (turn hasn't started) → waiting for you.
+    lc.last.unwrap_or(Activity::Waiting)
 }
 
 fn read_tail(path: &Path) -> Option<String> {
@@ -136,8 +149,7 @@ fn read_tail(path: &Path) -> Option<String> {
 // mirroring Claude Code's agents panel which shows each agent's latest line.
 // Best-effort over the same reverse-engineered rollout format as the status
 // classifier; any parse issue just yields None and the row falls back to path.
-fn last_agent_message(session: &SessionState) -> Option<String> {
-    let path = session.codex_rollout_path.as_ref()?;
+fn last_agent_message(path: &str) -> Option<String> {
     let tail = read_tail(Path::new(path))?;
     for line in tail.lines().rev() {
         let line = line.trim();
@@ -179,9 +191,12 @@ enum Bucket {
     Stopped,
 }
 
-fn session_bucket(s: &SessionState) -> Bucket {
+// Bucket for a session, using the activity computed once per reload (see
+// App::refresh_activity). Reading it from a map keeps draw/sort pure — no
+// rollout I/O happens while rendering, only when state is refreshed.
+fn bucket_of(activity: &HashMap<String, Activity>, s: &SessionState) -> Bucket {
     match s.status.as_str() {
-        STATUS_RUNNING => match classify_activity(s) {
+        STATUS_RUNNING => match activity.get(&s.id).copied().unwrap_or(Activity::Waiting) {
             Activity::Waiting => Bucket::NeedsInput,
             Activity::Active => Bucket::Working,
         },
@@ -370,7 +385,10 @@ fn manager_loop(terminal: &mut TerminalSession, app: &mut App) -> Result<()> {
                 }
                 render(app)?;
             }
-            Event::Resize(_, _) => render(app)?,
+            Event::Resize(_, _) => {
+                app.invalidate_frame();
+                render(app)?;
+            }
             _ => {}
         }
     }
@@ -396,6 +414,15 @@ struct App {
     // once we've scanned and found no confident match. Keeps the (potentially
     // large) codex sessions directory from being re-scanned every refresh.
     rollout_cache: HashMap<String, Option<String>>,
+    // Per-session derived state, computed once per reload (not per draw) so
+    // rendering does no file I/O: turn activity (via incremental lifecycle
+    // scan), its scan cursor, and the latest-message preview line.
+    activity: HashMap<String, Activity>,
+    lifecycle: HashMap<String, Lifecycle>,
+    preview: HashMap<String, String>,
+    // Previous rendered frame, one string per screen row, for diff-based
+    // drawing (only changed rows are rewritten — no full clear, no flicker).
+    prev_frame: Vec<String>,
 }
 
 impl App {
@@ -410,9 +437,14 @@ impl App {
             exit_confirm: None,
             rows: Vec::new(),
             rollout_cache: HashMap::new(),
+            activity: HashMap::new(),
+            lifecycle: HashMap::new(),
+            preview: HashMap::new(),
+            prev_frame: Vec::new(),
         };
         app.sessions = state::load_sessions()?;
         resolve_missing_rollouts(&mut app.sessions, &mut app.rollout_cache);
+        app.refresh_derived();
         app.sort_for_display();
         Ok(app)
     }
@@ -422,6 +454,7 @@ impl App {
         self.sessions = state::load_sessions()?;
         resolve_missing_rollouts(&mut self.sessions, &mut self.rollout_cache);
         sync_titles_from_history(&mut self.sessions);
+        self.refresh_derived();
         self.sort_for_display();
         if let Some(id) = selected_id {
             if let Some(pos) = self.sessions.iter().position(|s| s.id == id) {
@@ -434,14 +467,56 @@ impl App {
         Ok(())
     }
 
+    // Recompute the per-session derived state that draws/sorts read from —
+    // activity (bucket) and the message preview — ONCE per reload, so rendering
+    // stays pure formatting with no file I/O. Activity uses the incremental
+    // lifecycle scanner (see scan_lifecycle); the preview reads the rollout tail.
+    fn refresh_derived(&mut self) {
+        let items: Vec<(String, Option<String>, bool)> = self
+            .sessions
+            .iter()
+            .map(|s| (s.id.clone(), s.codex_rollout_path.clone(), s.status == STATUS_RUNNING))
+            .collect();
+        for (id, path, running) in &items {
+            match path {
+                Some(p) if *running => {
+                    let lc = self.lifecycle.entry(id.clone()).or_insert_with(|| Lifecycle {
+                        path: String::new(),
+                        offset: 0,
+                        last: None,
+                    });
+                    self.activity.insert(id.clone(), scan_lifecycle(lc, p));
+                }
+                _ => {
+                    self.activity.insert(id.clone(), Activity::Waiting);
+                }
+            }
+            match path.as_deref().and_then(last_agent_message) {
+                Some(msg) => {
+                    self.preview.insert(id.clone(), msg);
+                }
+                None => {
+                    self.preview.remove(id);
+                }
+            }
+        }
+        // Drop cache entries for sessions that no longer exist.
+        let ids: std::collections::HashSet<&String> = items.iter().map(|(id, _, _)| id).collect();
+        self.activity.retain(|k, _| ids.contains(k));
+        self.lifecycle.retain(|k, _| ids.contains(k));
+        self.preview.retain(|k, _| ids.contains(k));
+        self.rollout_cache.retain(|k, _| ids.contains(k));
+    }
+
     // Order sessions by bucket (Needs input, then Working, then Stopped),
     // most-recently-active first within each. Selection is tracked by id
     // across reloads, so re-sorting doesn't move the cursor off a session.
     fn sort_for_display(&mut self) {
+        let activity = std::mem::take(&mut self.activity);
         let mut decorated: Vec<(u8, u64, u64, SessionState)> = self
             .sessions
             .drain(..)
-            .map(|s| (bucket_rank(session_bucket(&s)), s.updated_at, s.created_at, s))
+            .map(|s| (bucket_rank(bucket_of(&activity, &s)), s.updated_at, s.created_at, s))
             .collect();
         decorated.sort_by(|a, b| {
             a.0.cmp(&b.0)
@@ -449,6 +524,7 @@ impl App {
                 .then_with(|| b.2.cmp(&a.2))
         });
         self.sessions = decorated.into_iter().map(|(_, _, _, s)| s).collect();
+        self.activity = activity;
     }
 
     fn current(&self) -> Option<&SessionState> {
@@ -477,6 +553,13 @@ impl App {
         if self.mode == Mode::Normal {
             self.message.clear();
         }
+    }
+
+    // Discard the diff cache so the next render repaints the whole screen. Call
+    // after anything that blanks the terminal behind our back — a resize, or
+    // returning from an attach (which left and re-entered the alt screen).
+    fn invalidate_frame(&mut self) {
+        self.prev_frame.clear();
     }
 }
 
@@ -692,6 +775,7 @@ fn attach_current(app: &mut App, terminal: &mut TerminalSession) -> Result<()> {
     terminal.leave()?;
     let result = attach::attach_session(&session);
     terminal.enter_again()?;
+    app.invalidate_frame(); // the attach blanked the alt screen — force a full repaint
     app.reload()?;
 
     match result {
@@ -1009,21 +1093,66 @@ fn content_width(cols: u16) -> usize {
     (cols as usize).min(MAX_CONTENT_COLS)
 }
 
+// Build one styled screen row into a String (ANSI included) by queueing into an
+// in-memory buffer. Lines carry no MoveTo and no trailing reset — the diff
+// emitter positions each row and resets colour after it.
+fn styled_line(build: impl FnOnce(&mut Vec<u8>)) -> String {
+    let mut buf = Vec::new();
+    build(&mut buf);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+fn put(frame: &mut [String], y: u16, s: String) {
+    if let Some(slot) = frame.get_mut(y as usize) {
+        *slot = s;
+    }
+}
+
+// Render by DIFFING against the previous frame: build every screen row into a
+// Vec<String>, then rewrite only the rows that actually changed. No whole-screen
+// clear each frame (that was the flicker, on every 700ms refresh and keystroke),
+// and when nothing changed we write nothing at all — so an idle manager is
+// perfectly still. All per-session I/O already happened in refresh_derived, so
+// building the frame is pure formatting.
 fn render(app: &mut App) -> Result<()> {
     let (cols, rows) = terminal::size().unwrap_or((100, 30));
+    let mut frame = vec![String::new(); rows as usize];
+
+    draw_header(&mut frame, cols, app);
+    draw_sessions(&mut frame, app, cols, rows);
+    draw_input(&mut frame, app, cols, rows);
+    draw_hint(&mut frame, cols, rows);
+
     let mut stdout = io::stdout();
-    queue!(stdout, ResetColor, Hide, Clear(ClearType::All), MoveTo(0, 0))?;
-
-    draw_header(&mut stdout, cols, app)?;
-    draw_sessions(&mut stdout, app, cols, rows)?;
-    draw_input(&mut stdout, app, cols, rows)?;
-    draw_hint(&mut stdout, cols, rows)?;
-
-    stdout.flush()?;
+    let mut wrote = false;
+    if app.prev_frame.len() != frame.len() {
+        // First paint or a resize: clear once, force every row to redraw.
+        queue!(stdout, ResetColor, Clear(ClearType::All))?;
+        app.prev_frame = vec![String::from("\u{1}"); frame.len()]; // sentinel ≠ any real row
+        wrote = true;
+    }
+    for (y, ln) in frame.iter().enumerate() {
+        if app.prev_frame[y] != *ln {
+            queue!(
+                stdout,
+                MoveTo(0, y as u16),
+                ResetColor,
+                Clear(ClearType::UntilNewLine)
+            )?;
+            stdout.write_all(ln.as_bytes())?;
+            queue!(stdout, ResetColor)?;
+            wrote = true;
+        }
+    }
+    if wrote {
+        queue!(stdout, Hide)?;
+        stdout.flush()?;
+        app.prev_frame = frame;
+    }
     Ok(())
 }
 
-fn draw_header(stdout: &mut io::Stdout, cols: u16, app: &App) -> Result<()> {
+fn draw_header(frame: &mut [String], cols: u16, app: &App) {
     let cw = content_width(cols);
     let title = "Codex Rail";
     let total = app.sessions.len();
@@ -1037,28 +1166,35 @@ fn draw_header(stdout: &mut io::Stdout, cols: u16, app: &App) -> Result<()> {
     let left_used = 2 + display_width(title);
     let right_w = display_width(&count_s);
     let gap = cw.saturating_sub(left_used + right_w);
-    queue!(
-        stdout,
-        MoveTo(0, 0),
-        SetForegroundColor(C_ACCENT),
-        SetAttribute(Attribute::Bold),
-        Print(format!("  {title}")),
-        SetAttribute(Attribute::Reset),
-        SetForegroundColor(C_DIM),
-        Print(format!("{}{count_s}", " ".repeat(gap))),
-        ResetColor
-    )?;
+    put(
+        frame,
+        0,
+        styled_line(|b| {
+            let _ = queue!(
+                b,
+                SetForegroundColor(C_ACCENT),
+                SetAttribute(Attribute::Bold),
+                Print(format!("  {title}")),
+                SetAttribute(Attribute::Reset),
+                SetForegroundColor(C_DIM),
+                Print(format!("{}{count_s}", " ".repeat(gap)))
+            );
+        }),
+    );
 
     // Faint rule under the title.
     let rule_w = cw.saturating_sub(2);
-    queue!(
-        stdout,
-        MoveTo(0, 1),
-        SetForegroundColor(C_FAINT),
-        Print(format!("  {}", "─".repeat(rule_w))),
-        ResetColor
-    )?;
-    Ok(())
+    put(
+        frame,
+        1,
+        styled_line(|b| {
+            let _ = queue!(
+                b,
+                SetForegroundColor(C_FAINT),
+                Print(format!("  {}", "─".repeat(rule_w)))
+            );
+        }),
+    );
 }
 
 enum DisplayItem {
@@ -1068,7 +1204,7 @@ enum DisplayItem {
     Row(usize),
 }
 
-fn draw_sessions(stdout: &mut io::Stdout, app: &mut App, cols: u16, rows: u16) -> Result<()> {
+fn draw_sessions(frame: &mut [String], app: &mut App, cols: u16, rows: u16) {
     app.rows.clear();
     let cw = content_width(cols);
 
@@ -1084,14 +1220,21 @@ fn draw_sessions(stdout: &mut io::Stdout, app: &mut App, cols: u16, rows: u16) -
     let max_rows = (last_list_y + 1).saturating_sub(start_y) as usize;
 
     if app.sessions.is_empty() {
-        queue!(
-            stdout,
-            MoveTo(0, start_y),
-            SetForegroundColor(C_DIM),
-            Print(fit("  No sessions yet — press e, type your first message, then Enter.", cw)),
-            ResetColor
-        )?;
-        return Ok(());
+        put(
+            frame,
+            start_y,
+            styled_line(|b| {
+                let _ = queue!(
+                    b,
+                    SetForegroundColor(C_DIM),
+                    Print(fit(
+                        "  No sessions yet — press e, type your first message, then Enter.",
+                        cw
+                    ))
+                );
+            }),
+        );
+        return;
     }
 
     // Group session indices by bucket, keeping the global sort order within
@@ -1100,7 +1243,7 @@ fn draw_sessions(stdout: &mut io::Stdout, app: &mut App, cols: u16, rows: u16) -
     // panel) instead of sections appearing and vanishing as statuses change.
     let mut by_bucket: [Vec<usize>; 3] = [Vec::new(), Vec::new(), Vec::new()];
     for (i, s) in app.sessions.iter().enumerate() {
-        by_bucket[bucket_slot(session_bucket(s))].push(i);
+        by_bucket[bucket_slot(bucket_of(&app.activity, s))].push(i);
     }
     let mut items: Vec<DisplayItem> = Vec::new();
     for (slot, b) in [Bucket::NeedsInput, Bucket::Working, Bucket::Stopped]
@@ -1134,25 +1277,25 @@ fn draw_sessions(stdout: &mut io::Stdout, app: &mut App, cols: u16, rows: u16) -
     for (visible, item) in items.iter().skip(offset).take(max_rows).enumerate() {
         let y = start_y + visible as u16;
         match item {
-            DisplayItem::Gap => {
-                queue!(stdout, MoveTo(0, y), ResetColor, Print(fit("", cw)))?;
-            }
-            DisplayItem::Empty => {
-                queue!(
-                    stdout,
-                    MoveTo(0, y),
-                    ResetColor,
-                    SetForegroundColor(C_FAINT),
-                    Print(fit_cols("       none", cw)),
-                    ResetColor
-                )?;
-            }
-            DisplayItem::Header(b, count) => {
-                draw_section_header(stdout, *b, *count, y)?;
-            }
+            DisplayItem::Gap => put(frame, y, String::new()),
+            DisplayItem::Empty => put(
+                frame,
+                y,
+                styled_line(|b| {
+                    let _ = queue!(b, SetForegroundColor(C_FAINT), Print(fit_cols("       none", cw)));
+                }),
+            ),
+            DisplayItem::Header(b, count) => put(frame, y, section_header_line(*b, *count)),
             DisplayItem::Row(index) => {
                 let selected = *index == app.selected;
-                draw_session_row(stdout, &app.sessions[*index], selected, y, cw, title_w)?;
+                let s = &app.sessions[*index];
+                let bucket = bucket_of(&app.activity, s);
+                let preview = app
+                    .preview
+                    .get(&s.id)
+                    .cloned()
+                    .unwrap_or_else(|| home_tilde(&s.cwd));
+                put(frame, y, session_row_line(s, bucket, &preview, selected, cw, title_w));
                 app.rows.push((y, *index));
             }
         }
@@ -1164,35 +1307,30 @@ fn draw_sessions(stdout: &mut io::Stdout, app: &mut App, cols: u16, rows: u16) -
     if let Some(sel) = app.sessions.get(app.selected) {
         // Tail-truncate so a long path keeps its meaningful end (…/project).
         let path = fit_cols_tail(&home_tilde(&sel.cwd), cw.saturating_sub(2));
-        queue!(
-            stdout,
-            MoveTo(0, box_top.saturating_sub(1)),
-            ResetColor,
-            SetForegroundColor(C_FAINT),
-            Print(fit_cols(&format!("  {path}"), cw)),
-            ResetColor
-        )?;
+        put(
+            frame,
+            box_top.saturating_sub(1),
+            styled_line(|b| {
+                let _ = queue!(b, SetForegroundColor(C_FAINT), Print(fit_cols(&format!("  {path}"), cw)));
+            }),
+        );
     }
-
-    Ok(())
 }
 
 // Section header: coloured glyph + name (bold, bucket colour) + dim count.
 // The glyph sits at column 2 so it lines up with each row's own glyph below.
-fn draw_section_header(stdout: &mut io::Stdout, b: Bucket, count: usize, y: u16) -> Result<()> {
-    queue!(
-        stdout,
-        MoveTo(0, y),
-        ResetColor,
-        SetForegroundColor(bucket_color(b)),
-        SetAttribute(Attribute::Bold),
-        Print(format!("  {} {}", bucket_glyph(b), bucket_title(b))),
-        SetAttribute(Attribute::Reset),
-        SetForegroundColor(C_DIM),
-        Print(format!("  {count}")),
-        ResetColor
-    )?;
-    Ok(())
+fn section_header_line(b: Bucket, count: usize) -> String {
+    styled_line(|buf| {
+        let _ = queue!(
+            buf,
+            SetForegroundColor(bucket_color(b)),
+            SetAttribute(Attribute::Bold),
+            Print(format!("  {} {}", bucket_glyph(b), bucket_title(b))),
+            SetAttribute(Attribute::Reset),
+            SetForegroundColor(C_DIM),
+            Print(format!("  {count}"))
+        );
+    })
 }
 
 // Title-column width: sized to the widest title actually present (so short
@@ -1217,15 +1355,14 @@ fn session_columns(sessions: &[SessionState], cw: usize) -> usize {
 // stopped) falls back to its path so rows stay distinguishable. The segments
 // sum to exactly `cw`, so age lands at the right edge. Display-column widths
 // keep CJK aligned.
-fn draw_session_row(
-    stdout: &mut io::Stdout,
+fn session_row_line(
     session: &SessionState,
+    bucket: Bucket,
+    preview: &str,
     selected: bool,
-    y: u16,
     cw: usize,
     title_w: usize,
-) -> Result<()> {
-    let bucket = session_bucket(session);
+) -> String {
     let mut age: String = format_age(last_activity_secs(session)).chars().take(4).collect();
     while age.chars().count() < 4 {
         age.insert(0, ' '); // right-align in a fixed 4-wide column
@@ -1233,45 +1370,40 @@ fn draw_session_row(
 
     let title_s = fit_cols(&session.title, title_w);
     let title_color = if selected { C_SELTITLE } else { C_TITLE };
-
-    let preview = last_agent_message(session).unwrap_or_else(|| home_tilde(&session.cwd));
     let msg_w = cw.saturating_sub(title_w + 12);
-    let preview_s = fit_cols(&preview, msg_w);
+    let preview_s = fit_cols(preview, msg_w);
 
-    if selected {
-        queue!(stdout, SetBackgroundColor(C_SEL_BG))?;
-    } else {
-        queue!(stdout, ResetColor)?;
-    }
-    queue!(stdout, MoveTo(0, y))?;
-    if selected {
-        queue!(stdout, SetForegroundColor(C_ACCENT), Print("▌"), Print(" "))?;
-    } else {
-        queue!(stdout, Print("  "))?;
-    }
-    queue!(
-        stdout,
-        SetForegroundColor(bucket_color(bucket)),
-        Print(format!("{} ", bucket_glyph(bucket))),
-        SetForegroundColor(title_color),
-        Print(title_s),
-        Print("  "),
-        SetForegroundColor(C_DIM),
-        Print(preview_s),
-        Print("  "),
-        SetForegroundColor(if selected { C_DIM } else { C_FAINT }),
-        Print(age),
-        ResetColor
-    )?;
-    Ok(())
+    styled_line(|b| {
+        if selected {
+            let _ = queue!(b, SetBackgroundColor(C_SEL_BG));
+        }
+        if selected {
+            let _ = queue!(b, SetForegroundColor(C_ACCENT), Print("▌"), Print(" "));
+        } else {
+            let _ = queue!(b, Print("  "));
+        }
+        let _ = queue!(
+            b,
+            SetForegroundColor(bucket_color(bucket)),
+            Print(format!("{} ", bucket_glyph(bucket))),
+            SetForegroundColor(title_color),
+            Print(title_s),
+            Print("  "),
+            SetForegroundColor(C_DIM),
+            Print(preview_s),
+            Print("  "),
+            SetForegroundColor(if selected { C_DIM } else { C_FAINT }),
+            Print(age)
+        );
+    })
 }
 
-fn draw_input(stdout: &mut io::Stdout, app: &App, cols: u16, rows: u16) -> Result<()> {
+fn draw_input(frame: &mut [String], app: &App, cols: u16, rows: u16) {
     let cw = content_width(cols);
     let box_top = rows.saturating_sub(4);
     let box_w = cw.saturating_sub(2); // box occupies columns [2, 2+box_w)
     if box_w < 6 {
-        return Ok(());
+        return;
     }
     let inner = box_w - 2; // usable columns between the two side borders
 
@@ -1286,14 +1418,13 @@ fn draw_input(stdout: &mut io::Stdout, app: &App, cols: u16, rows: u16) -> Resul
         let rest = (box_w - 2).saturating_sub(1 + msg_w);
         (format!("╭─{}{}╮", msg_s, "─".repeat(rest)), C_NEEDS)
     };
-    queue!(
-        stdout,
-        MoveTo(0, box_top),
-        ResetColor,
-        SetForegroundColor(top_color),
-        Print(format!("  {top}")),
-        ResetColor
-    )?;
+    put(
+        frame,
+        box_top,
+        styled_line(|b| {
+            let _ = queue!(b, SetForegroundColor(top_color), Print(format!("  {top}")));
+        }),
+    );
 
     // Middle line: "│ ❯ <text> │". In Normal mode this is a dim hint; while
     // typing it's the entered name. The mode (new/rename) shows on the border.
@@ -1304,47 +1435,55 @@ fn draw_input(stdout: &mut io::Stdout, app: &App, cols: u16, rows: u16) -> Resul
         ),
         Mode::New | Mode::Rename => (app.input.clone(), C_TITLE),
     };
-    queue!(
-        stdout,
-        MoveTo(0, box_top + 1),
-        ResetColor,
-        SetForegroundColor(C_ACCENT_DIM),
-        Print("  │"),
-        SetForegroundColor(C_ACCENT),
-        Print(" ❯ "),
-        SetForegroundColor(body_color),
-        Print(fit_cols(&body_text, inner.saturating_sub(3))),
-        SetForegroundColor(C_ACCENT_DIM),
-        Print("│"),
-        ResetColor
-    )?;
+    put(
+        frame,
+        box_top + 1,
+        styled_line(|b| {
+            let _ = queue!(
+                b,
+                SetForegroundColor(C_ACCENT_DIM),
+                Print("  │"),
+                SetForegroundColor(C_ACCENT),
+                Print(" ❯ "),
+                SetForegroundColor(body_color),
+                Print(fit_cols(&body_text, inner.saturating_sub(3))),
+                SetForegroundColor(C_ACCENT_DIM),
+                Print("│")
+            );
+        }),
+    );
 
     // Bottom border.
-    queue!(
-        stdout,
-        MoveTo(0, box_top + 2),
-        SetForegroundColor(C_ACCENT_DIM),
-        Print(format!("  ╰{}╯", "─".repeat(box_w - 2))),
-        ResetColor
-    )?;
-    Ok(())
+    put(
+        frame,
+        box_top + 2,
+        styled_line(|b| {
+            let _ = queue!(
+                b,
+                SetForegroundColor(C_ACCENT_DIM),
+                Print(format!("  ╰{}╯", "─".repeat(box_w - 2)))
+            );
+        }),
+    );
 }
 
 // Compact key hints on the last line, using terse symbols instead of the old
 // full-width "Ctrl-X Ctrl-X" wall of text.
-fn draw_hint(stdout: &mut io::Stdout, cols: u16, rows: u16) -> Result<()> {
+fn draw_hint(frame: &mut [String], cols: u16, rows: u16) {
     // Uses the full terminal width and display-width-aware fitting so the "·"
     // separators (2 bytes each) don't get miscounted and clip the last word.
     let hint = "w/s move · enter attach · e new · ^R rename · ^X ^X stop · esc esc quit";
-    queue!(
-        stdout,
-        MoveTo(0, rows.saturating_sub(1)),
-        ResetColor,
-        SetForegroundColor(C_DIM),
-        Print(fit_cols(&format!("  {hint}"), cols as usize)),
-        ResetColor
-    )?;
-    Ok(())
+    put(
+        frame,
+        rows.saturating_sub(1),
+        styled_line(|b| {
+            let _ = queue!(
+                b,
+                SetForegroundColor(C_DIM),
+                Print(fit_cols(&format!("  {hint}"), cols as usize))
+            );
+        }),
+    );
 }
 
 fn truncate(text: &str, max: usize) -> String {
