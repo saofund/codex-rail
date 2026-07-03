@@ -257,7 +257,48 @@ fn reconcile_liveness(state: &mut SessionState) {
 }
 
 fn worker_alive(pid: u32) -> bool {
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    // kill(pid, 0) also succeeds for a zombie — a process that has already
+    // exited but hasn't been reaped by its parent. On systems whose init
+    // doesn't reap orphans (e.g. a bare container PID 1), a crashed worker
+    // lingers as <defunct> indefinitely; treating it as alive would pin its
+    // session to "running" forever and make it unstoppable (its socket is
+    // gone, so STOP can't connect). So reject processes in the zombie state.
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
+        return false;
+    }
+    !proc_is_zombie(pid)
+}
+
+fn proc_is_zombie(pid: u32) -> bool {
+    // /proc/<pid>/stat is "PID (comm) STATE ...". comm can contain spaces and
+    // parens, so scan past the last ")"; the next non-space char is the state.
+    // No /proc (non-Linux) → fall back to the kill() result (not a zombie).
+    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    match stat.rfind(") ") {
+        Some(idx) => stat[idx + 2..].trim_start().starts_with('Z'),
+        None => false,
+    }
+}
+
+/// Whether a worker with this pid is a genuinely live process (not absent, not
+/// a zombie). Used by the manager to decide stop-vs-remove for a session.
+pub fn worker_is_running(pid: Option<u32>) -> bool {
+    pid.map(worker_alive).unwrap_or(false)
+}
+
+/// Delete a stopped session's on-disk footprint so it leaves the manager list.
+/// The caller must ensure the worker is not running — removing a live
+/// session's dir would pull the ground out from under its worker.
+pub fn remove_session(id: &str) -> Result<()> {
+    // Best-effort socket cleanup; a cleanly-exited worker already removed it.
+    fs::remove_file(socket_path(id)).ok();
+    let dir = job_dir(id);
+    if dir.exists() {
+        fs::remove_dir_all(&dir).with_context(|| format!("remove {}", dir.display()))?;
+    }
+    Ok(())
 }
 
 fn home_dir() -> PathBuf {

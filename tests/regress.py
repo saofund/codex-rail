@@ -12,6 +12,11 @@ codex rollouts, neither of which a fake could exercise.
     C  `e` + text creates a session whose title is stored in label.json
     D  Space is reserved and never opens the composer
     E  rename on an idle/exited session sticks
+    F  Working status latches through a long silent turn (incremental lifecycle scan)
+    G  idle manager does zero full-screen clears (line-diff renderer, no flicker)
+    H  attach then detach repaints the manager (no blank screen)
+    I  Ctrl-X twice removes a stopped session from the list and disk
+    J  a zombie worker is treated as stopped (not alive) and is removable
 
 Usage:  python3 tests/regress.py ./target/release/rail [./tests/fakecodex]
 """
@@ -331,10 +336,62 @@ def test_h():
         mgr.close(); kill_children(jobs)
 
 
+# ---- I: Ctrl-X twice removes a stopped session from the list ----
+def test_i():
+    print("\n== I: Ctrl-X twice removes a stopped session ==")
+    data, run, jobs, sp = setup("gone", "REMOVE_ME", status="exited")
+    mgr = Manager(data, run)
+    try:
+        listed_before = mgr.row_with("REMOVE_ME") is not None
+        mgr.send(b"\x18", 0.4)                       # first Ctrl-X: arm + confirm prompt
+        confirm = "remove this stopped" in mgr.text()
+        mgr.send(b"\x18", 0.8)                       # second Ctrl-X: remove
+        time.sleep(0.6)
+        gone_screen = mgr.row_with("REMOVE_ME") is None
+        dir_gone = not os.path.exists(jobs + "/gone")
+        ok = listed_before and confirm and gone_screen and dir_gone
+        print(f"   listed_before={listed_before} confirm_prompt={confirm} "
+              f"gone_from_screen={gone_screen} dir_deleted={dir_gone}")
+        print("   ", "PASS" if ok else "FAIL")
+        return ok
+    finally:
+        mgr.close()
+
+
+# ---- J: a zombie worker (defunct, unreaped) is treated as stopped, not alive ----
+def test_j():
+    print("\n== J: zombie worker reconciles to Stopped and is removable ==")
+    zpid = os.fork()
+    if zpid == 0:
+        os._exit(0)                                  # exits at once -> zombie (never reaped here)
+    time.sleep(0.2)
+    stt = open(f"/proc/{zpid}/stat").read()
+    zstate = stt[stt.rfind(") ") + 2:].strip()[0]    # sanity: kernel state char is 'Z'
+    data, run, jobs, sp = setup("zomb", "ZOMBIE_ROW",
+                                status="running", worker_pid=zpid, child_pid=99999999)
+    mgr = Manager(data, run)
+    try:
+        row = mgr.row_with("ZOMBIE_ROW") or ""
+        reconciled = "○" in row                 # ○ hollow = Stopped bucket (kill(pid,0) alone would say alive)
+        mgr.send(b"\x18", 0.4); mgr.send(b"\x18", 0.8); time.sleep(0.6)
+        removed = mgr.row_with("ZOMBIE_ROW") is None and not os.path.exists(jobs + "/zomb")
+        ok = zstate == "Z" and reconciled and removed
+        print(f"   proc_state={zstate!r} reconciled_to_stopped={reconciled} removable={removed}")
+        print("   ", "PASS" if ok else "FAIL")
+        return ok
+    finally:
+        mgr.close()
+        try:
+            os.waitpid(zpid, 0)
+        except Exception:
+            pass
+
+
 if __name__ == "__main__":
     results = {}
     for name, fn in [("A", test_a), ("B", test_b), ("C", test_c), ("D", test_d),
-                     ("E", test_e), ("F", test_f), ("G", test_g), ("H", test_h)]:
+                     ("E", test_e), ("F", test_f), ("G", test_g), ("H", test_h),
+                     ("I", test_i), ("J", test_j)]:
         try:
             results[name] = fn()
         except Exception as e:

@@ -81,7 +81,14 @@ Design points:
   TUI would keep every session looking busy.
 - **Needs input vs Stopped.** *Needs input* means the process is alive but codex
   finished its turn and is waiting for you. *Stopped* means the process has
-  exited — it needs a resume, not a reply.
+  exited — it needs a resume, not a reply. Liveness is checked from the worker's
+  actual process state, and a **zombie** (a worker that exited but wasn't reaped,
+  e.g. under a container init that doesn't reap orphans) counts as stopped, not
+  alive — otherwise its session would be pinned to "running" forever and could
+  never be stopped or removed.
+- **Removing a session** (`Ctrl-X` on an already-stopped one) deletes only
+  rail's own per-session dir; codex's transcript under `~/.codex/sessions` stays,
+  so nothing you did in that session is lost from codex's own history.
 - **Resume reuses the same rollout file**, so a resumed session's status stays
   accurate.
 
@@ -94,7 +101,9 @@ Manager screen:
 - `e`, or just start typing: compose a new session — your text becomes codex's
   first message (empty → a blank, auto-numbered session)
 - `Ctrl-R`: rename the selected session (pins the title against auto-sync)
-- `Ctrl-X` twice within 2s: stop the selected session
+- `Ctrl-X` twice within 2s: stop the selected session; press it twice again on an
+  already-stopped session to **remove** it from the list (deletes its state, so
+  the row finally goes away — the codex transcript on disk is left untouched)
 - `Esc` twice within 2s: leave the manager (sessions keep running)
 - `Space` is reserved for a future feature and does nothing here
 

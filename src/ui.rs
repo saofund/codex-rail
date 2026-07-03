@@ -1033,11 +1033,19 @@ fn wait_for_socket(socket: &str) {
     }
 }
 
+// Ctrl-X does one of two things depending on whether the session is live:
+// a running session is *stopped* (SIGTERM via the worker socket); an
+// already-stopped one is *removed* from the list (its job dir is deleted, so
+// the row finally goes away). Both need the same double-press confirm. Liveness
+// is checked from the actual worker pid, not just the status string, so a
+// crashed/zombie worker is treated as stopped and can be cleared.
 fn stop_with_confirmation(app: &mut App) -> Result<()> {
     let Some(session) = app.current().cloned() else {
         app.message = "no session".to_string();
         return Ok(());
     };
+
+    let live = session.status == STATUS_STARTING || state::worker_is_running(session.worker_pid);
 
     let confirmed = app
         .stop_confirm
@@ -1047,13 +1055,18 @@ fn stop_with_confirmation(app: &mut App) -> Result<()> {
 
     if !confirmed {
         app.stop_confirm = Some((session.id, Instant::now()));
-        app.message = "Ctrl-X again to stop this session".to_string();
+        app.message = if live {
+            "Ctrl-X again to stop this session".to_string()
+        } else {
+            "Ctrl-X again to remove this stopped session".to_string()
+        };
         return Ok(());
     }
 
-    match UnixStream::connect(&session.socket) {
-        Ok(mut stream) => {
-            match stream.write_all(b"STOP\n").and_then(|_| stream.flush()) {
+    app.stop_confirm = None;
+    if live {
+        match UnixStream::connect(&session.socket) {
+            Ok(mut stream) => match stream.write_all(b"STOP\n").and_then(|_| stream.flush()) {
                 Ok(()) => {
                     app.message = "stop requested".to_string();
                     app.reload()?;
@@ -1061,12 +1074,23 @@ fn stop_with_confirmation(app: &mut App) -> Result<()> {
                 Err(err) => {
                     app.message = format!("stop failed: {err}");
                 }
+            },
+            Err(err) => {
+                app.message = format!("stop failed: {err}");
             }
-            app.stop_confirm = None;
         }
-        Err(err) => {
-            app.stop_confirm = None;
-            app.message = format!("stop failed: {err}");
+    } else {
+        match state::remove_session(&session.id) {
+            Ok(()) => {
+                app.message = "session removed".to_string();
+                // The list just shrank; force a clean full repaint so no stale
+                // row is left behind below the shortened list.
+                app.invalidate_frame();
+                app.reload()?;
+            }
+            Err(err) => {
+                app.message = format!("remove failed: {err}");
+            }
         }
     }
     Ok(())
@@ -1472,7 +1496,8 @@ fn draw_input(frame: &mut [String], app: &App, cols: u16, rows: u16) {
 fn draw_hint(frame: &mut [String], cols: u16, rows: u16) {
     // Uses the full terminal width and display-width-aware fitting so the "·"
     // separators (2 bytes each) don't get miscounted and clip the last word.
-    let hint = "w/s move · enter attach · e new · ^R rename · ^X ^X stop · esc esc quit";
+    let hint =
+        "w/s move · enter attach · e new · ^R rename · ^X ^X stop/remove · esc esc quit";
     put(
         frame,
         rows.saturating_sub(1),
