@@ -295,9 +295,19 @@ pub fn remove_session(id: &str) -> Result<()> {
     // Best-effort socket cleanup; a cleanly-exited worker already removed it.
     fs::remove_file(socket_path(id)).ok();
     let dir = job_dir(id);
-    if dir.exists() {
-        fs::remove_dir_all(&dir).with_context(|| format!("remove {}", dir.display()))?;
+    // Removing state.json is what actually delists the session — load_sessions
+    // skips any dir without it — so that step is the one that must succeed.
+    let state = dir.join("state.json");
+    if state.exists() {
+        fs::remove_file(&state).with_context(|| format!("remove {}", state.display()))?;
     }
+    // The rest is best-effort. On a network filesystem, an output.log a
+    // lingering process still holds open is silly-renamed to .nfsXXXX rather
+    // than deleted, so remove_dir_all can't empty the dir; the session is
+    // already gone from the list, so that must not surface as a failure.
+    fs::remove_file(label_path(id)).ok();
+    fs::remove_file(log_path(id)).ok();
+    fs::remove_dir_all(&dir).ok();
     Ok(())
 }
 
