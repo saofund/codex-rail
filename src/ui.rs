@@ -789,6 +789,48 @@ fn handle_mouse(
     Ok(false)
 }
 
+// The one thing a new user genuinely cannot discover on their own: once codex
+// takes over the screen there is nothing on it that says how to get back, and
+// Ctrl-Z's usual meaning (suspend the job) actively misleads. codex renders
+// inline with no status bar we can piggy-back on, so we teach the escape once —
+// a full-screen note shown only on the very first attach, then never again
+// (subsequent attaches are instant).
+fn show_detach_hint_once() {
+    let flag = state::data_dir().join(".detach_hint_seen");
+    if flag.exists() {
+        return;
+    }
+    let (cols, rows) = terminal::size().unwrap_or((80, 24));
+    let center = |text: &str| cols.saturating_sub(display_width(text) as u16) / 2;
+    let cy = rows / 2;
+    let l1 = "Attaching to codex \u{2026}";
+    let l2 = "Press  Ctrl-Z  any time to come back to rail.";
+    let mut out = io::stdout();
+    let _ = execute!(
+        out,
+        Clear(ClearType::All),
+        MoveTo(center(l1), cy.saturating_sub(1)),
+        SetForegroundColor(C_DIM),
+        Print(l1),
+        MoveTo(center(l2), cy + 1),
+        SetForegroundColor(C_ACCENT),
+        SetAttribute(Attribute::Bold),
+        Print(l2),
+        SetAttribute(Attribute::Reset),
+        ResetColor
+    );
+    let _ = out.flush();
+    thread::sleep(Duration::from_millis(1400));
+    // Clear the note before handing off: codex renders inline (not in an alt
+    // screen) and never clears the screen itself, so without this its first
+    // output would draw right under the hint instead of on a clean screen.
+    let _ = execute!(out, ResetColor, Clear(ClearType::All), MoveTo(0, 0));
+    let _ = out.flush();
+    // Best-effort persist — if it fails the hint simply shows again next time.
+    let _ = state::ensure_base_dirs();
+    let _ = fs::write(&flag, b"1\n");
+}
+
 fn attach_current(app: &mut App, terminal: &mut TerminalSession) -> Result<()> {
     let Some(mut session) = app.current().cloned() else {
         app.message = "no session".to_string();
@@ -810,6 +852,7 @@ fn attach_current(app: &mut App, terminal: &mut TerminalSession) -> Result<()> {
     }
 
     terminal.leave()?;
+    show_detach_hint_once();
     let result = attach::attach_session(&session);
     terminal.enter_again()?;
     app.invalidate_frame(); // the attach blanked the alt screen — force a full repaint
@@ -1281,9 +1324,12 @@ fn draw_sessions(frame: &mut [String], app: &mut App, cols: u16, rows: u16) {
     let max_rows = (last_list_y + 1).saturating_sub(start_y) as usize;
 
     if app.sessions.is_empty() {
+        // Rest the empty-state line at the vertical middle of the list area, not
+        // its top edge — a calm centre is where the eye lands.
+        let mid = start_y + (max_rows as u16) / 2;
         put(
             frame,
-            start_y,
+            mid,
             styled_line(|b| {
                 let _ = queue!(
                     b,
@@ -1329,14 +1375,21 @@ fn draw_sessions(frame: &mut [String], app: &mut App, cols: u16, rows: u16) {
         .iter()
         .position(|it| matches!(it, DisplayItem::Row(i) if *i == app.selected))
         .unwrap_or(0);
-    let offset = if max_rows == 0 {
-        0
+    // When the whole panel fits, float it toward the vertical middle of the list
+    // area rather than pinning it under the header — the eye rests at the centre
+    // of the screen, not its top edge. When it overflows, fall back to a normal
+    // top-anchored scroll that keeps the selected row visible (centring a
+    // scrolling list is where it would get jumpy).
+    let (render_start_y, offset) = if max_rows == 0 {
+        (start_y, 0)
+    } else if items.len() <= max_rows {
+        (start_y + ((max_rows - items.len()) / 2) as u16, 0)
     } else {
-        sel_pos.saturating_sub(max_rows.saturating_sub(1))
+        (start_y, sel_pos.saturating_sub(max_rows.saturating_sub(1)))
     };
 
     for (visible, item) in items.iter().skip(offset).take(max_rows).enumerate() {
-        let y = start_y + visible as u16;
+        let y = render_start_y + visible as u16;
         match item {
             DisplayItem::Gap => put(frame, y, String::new()),
             DisplayItem::Empty => put(
@@ -1534,7 +1587,7 @@ fn draw_hint(frame: &mut [String], cols: u16, rows: u16) {
     // Uses the full terminal width and display-width-aware fitting so the "·"
     // separators (2 bytes each) don't get miscounted and clip the last word.
     let hint =
-        "w/s move · enter attach · e new · ^R rename · ^X ^X stop/remove · esc esc quit";
+        "w/s move · enter attach (^Z back) · e new · ^R rename · ^X ^X stop/remove · esc esc quit";
     put(
         frame,
         rows.saturating_sub(1),

@@ -523,6 +523,46 @@ def audit(rail, pngdir=None):
     finally:
         c.close()
 
+    # 11) detach hint: the escape is taught once on the first-ever attach (codex
+    #     renders inline with no chrome to hook, so a first-run note is how a new
+    #     user learns Ctrl-Z), then never shown again.
+    c = Cockpit(rail, codex=FAKE_STREAM).boot()
+    try:
+        flag = os.path.join(os.path.dirname(c.jobs), ".detach_hint_seen")
+        m0 = c.mark()
+        c.new("hello world")                         # create -> first-ever auto-attach
+        taught = b"come back to rail" in c.raw_since(m0)
+        flagged = os.path.exists(flag)
+        snap(c, "11_detach_hint")
+        c.key(b"\x1a", 1.0)                           # detach
+        m1 = c.mark()
+        c.goto("hello world"); c.key(b"\r", 2.2)      # attach a SECOND time
+        again = b"come back to rail" in c.raw_since(m1)
+        c.key(b"\x1a", 0.6)
+        check("detach hint: taught on first attach only",
+              taught and flagged and not again,
+              f"taught={taught} flag={flagged} shown_again={again}")
+    finally:
+        c.close()
+
+    # 12) layout: the panel floats to the vertical middle when it fits, so the
+    #     eye rests on the selected row instead of the top edge (empty-state hint
+    #     and the first section header are both pushed well below the header rule).
+    c = Cockpit(rail).boot()
+    try:
+        rws = c.rows()
+        empty_idx = next((i for i, r in enumerate(rws) if "No sessions yet" in r), -1)
+        c.seed("mid-0", "MIDDLE_ROW", status="exited")
+        time.sleep(1.0)
+        rws = c.rows()
+        hdr_idx = next((i for i, r in enumerate(rws) if "Needs input" in r), -1)
+        # top-pinned would sit at row ~3; floated pushes both well down (~15 @ 40 rows)
+        check("layout: panel floats to vertical middle when it fits",
+              empty_idx >= 8 and hdr_idx >= 8, f"empty_row={empty_idx} needsinput_row={hdr_idx}")
+        snap(c, "12_centered")
+    finally:
+        c.close()
+
     # ---- summary
     npass = sum(1 for _, ok, _ in results if ok)
     print(f"\n==== {npass}/{len(results)} checks PASS ====")

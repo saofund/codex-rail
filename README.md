@@ -91,6 +91,10 @@ Design points:
   so nothing you did in that session is lost from codex's own history.
 - **Resume reuses the same rollout file**, so a resumed session's status stays
   accurate.
+- **The panel rests where your eyes are.** When the sessions fit on screen the
+  whole list floats to the vertical middle instead of pinning under the header —
+  a programmer's gaze sits at the centre of the screen, not its top edge. It only
+  falls back to a top-anchored scroll once there are more sessions than fit.
 
 ## Controls
 
@@ -109,7 +113,10 @@ Manager screen:
 
 Attached session:
 
-- `Ctrl-Z`: detach back to the manager
+- `Ctrl-Z`: detach back to the manager. codex draws over the whole screen with
+  no room for a persistent status bar, so rail shows this one hint full-screen on
+  your very first attach (and prints it in the manager's footer as `enter attach
+  (^Z back)`) — after that, attaches are instant.
 - every other key passes through to codex
 
 ## Install
