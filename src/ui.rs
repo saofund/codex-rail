@@ -125,6 +125,44 @@ fn read_tail(path: &Path) -> Option<String> {
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
+// Newest agent (codex) message in the rollout — the row's activity preview,
+// mirroring Claude Code's agents panel which shows each agent's latest line.
+// Best-effort over the same reverse-engineered rollout format as the status
+// classifier; any parse issue just yields None and the row falls back to path.
+fn last_agent_message(session: &SessionState) -> Option<String> {
+    let path = session.codex_rollout_path.as_ref()?;
+    let tail = read_tail(Path::new(path))?;
+    for line in tail.lines().rev() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(payload) = value.get("payload") else {
+            continue;
+        };
+        if payload.get("type").and_then(|t| t.as_str()) != Some("agent_message") {
+            continue;
+        }
+        if let Some(msg) = payload.get("message").and_then(|m| m.as_str()) {
+            let preview = preview_line(msg);
+            if !preview.is_empty() {
+                return Some(preview);
+            }
+        }
+    }
+    None
+}
+
+// Collapse a message to a single tidy preview line: first non-empty line with
+// runs of whitespace squeezed to single spaces.
+fn preview_line(s: &str) -> String {
+    let line = s.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    line.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 // Sessions are grouped into these buckets in the list, mirroring Claude
 // Code's own agents panel (Needs input / Working / Stopped).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -922,10 +960,9 @@ fn draw_sessions(stdout: &mut io::Stdout, app: &mut App, cols: u16, rows: u16) -
     app.rows.clear();
     let cw = content_width(cols);
 
-    // Size the title/path columns to the actual content (capped), so the age
-    // column sits right after the paths instead of being flung to the far
-    // edge. This is the fix for the "dead gap" down the middle of every row.
-    let (title_w, path_w) = session_columns(&app.sessions, cw);
+    // Size the title column to the actual content (capped); the message-preview
+    // column then fills the middle and age sits at the right edge — no dead gap.
+    let title_w = session_columns(&app.sessions, cw);
 
     // List sits between the header rule and the bottom input box. The box top
     // is at rows-4 (see draw_input); leave one blank line above it as a gap.
@@ -1003,10 +1040,26 @@ fn draw_sessions(stdout: &mut io::Stdout, app: &mut App, cols: u16, rows: u16) -
             }
             DisplayItem::Row(index) => {
                 let selected = *index == app.selected;
-                draw_session_row(stdout, &app.sessions[*index], selected, y, cw, title_w, path_w)?;
+                draw_session_row(stdout, &app.sessions[*index], selected, y, cw, title_w)?;
                 app.rows.push((y, *index));
             }
         }
+    }
+
+    // Context line just above the input box: the selected session's full path.
+    // Rows themselves show the latest message, so this keeps "where it runs"
+    // visible for the highlighted session without a per-row path column.
+    if let Some(sel) = app.sessions.get(app.selected) {
+        // Tail-truncate so a long path keeps its meaningful end (…/project).
+        let path = fit_cols_tail(&home_tilde(&sel.cwd), cw.saturating_sub(2));
+        queue!(
+            stdout,
+            MoveTo(0, box_top.saturating_sub(1)),
+            ResetColor,
+            SetForegroundColor(C_FAINT),
+            Print(fit_cols(&format!("  {path}"), cw)),
+            ResetColor
+        )?;
     }
 
     Ok(())
@@ -1030,35 +1083,28 @@ fn draw_section_header(stdout: &mut io::Stdout, b: Bucket, count: usize, y: u16)
     Ok(())
 }
 
-// Column widths for the list: sized to the widest title/path actually
-// present (so short lists stay tight and the age column hugs the content),
-// but capped and shrunk to fit the available width. Fixed pieces per row:
-// marker(2) glyph+sp(2) gap(2) gap(2) age(4) = 12 columns.
-fn session_columns(sessions: &[SessionState], cw: usize) -> (usize, usize) {
-    const OVERHEAD: usize = 12;
-    let max_title = sessions.iter().map(|s| display_width(&s.title)).max().unwrap_or(10);
-    let max_path = sessions
+// Title-column width: sized to the widest title actually present (so short
+// lists stay tight), capped at ~a third of the row so the message-preview
+// column and age still get room. Fixed pieces per row: marker(2) glyph+sp(2)
+// gap(2) gap(2) age(4) = 12 columns; the preview fills whatever's left.
+fn session_columns(sessions: &[SessionState], cw: usize) -> usize {
+    let max_title = sessions
         .iter()
-        .map(|s| display_width(&home_tilde(&s.cwd)))
+        .map(|s| display_width(&s.title))
         .max()
         .unwrap_or(10);
-    let mut title_w = max_title.clamp(6, 26);
-    let mut path_w = max_path.clamp(6, 30);
-    if title_w + path_w + OVERHEAD > cw {
-        let excess = title_w + path_w + OVERHEAD - cw;
-        let cut = excess.min(path_w.saturating_sub(6));
-        path_w -= cut;
-        let excess = (title_w + path_w + OVERHEAD).saturating_sub(cw);
-        title_w = title_w.saturating_sub(excess);
-    }
-    (title_w, path_w)
+    let cap = 26.min(cw.saturating_sub(20)).max(6);
+    max_title.clamp(6, cap)
 }
 
-// One session row, drawn in coloured segments packed into a tight left block:
-//   ▌ {glyph} {title}  {path}  {age}
-// The selected row gets a terracotta left bar (▌, in the left margin) and a
-// warm background stretched across the whole content width. Widths are
-// display-column based so CJK titles/paths stay aligned.
+// One session row, drawn in coloured segments:
+//   ▌ {glyph} {title}   {latest codex message}                     {age}
+// The selected row gets a terracotta left bar (▌) and a warm background across
+// the full content width. The middle is codex's latest line (Claude Code's
+// agents panel does the same); a session with no codex message yet (new or
+// stopped) falls back to its path so rows stay distinguishable. The segments
+// sum to exactly `cw`, so age lands at the right edge. Display-column widths
+// keep CJK aligned.
 fn draw_session_row(
     stdout: &mut io::Stdout,
     session: &SessionState,
@@ -1066,7 +1112,6 @@ fn draw_session_row(
     y: u16,
     cw: usize,
     title_w: usize,
-    path_w: usize,
 ) -> Result<()> {
     let bucket = session_bucket(session);
     let mut age: String = format_age(last_activity_secs(session)).chars().take(4).collect();
@@ -1075,8 +1120,11 @@ fn draw_session_row(
     }
 
     let title_s = fit_cols(&session.title, title_w);
-    let path_s = fit_cols_tail(&home_tilde(&session.cwd), path_w);
     let title_color = if selected { C_SELTITLE } else { C_TITLE };
+
+    let preview = last_agent_message(session).unwrap_or_else(|| home_tilde(&session.cwd));
+    let msg_w = cw.saturating_sub(title_w + 12);
+    let preview_s = fit_cols(&preview, msg_w);
 
     if selected {
         queue!(stdout, SetBackgroundColor(C_SEL_BG))?;
@@ -1097,19 +1145,12 @@ fn draw_session_row(
         Print(title_s),
         Print("  "),
         SetForegroundColor(C_DIM),
-        Print(path_s),
+        Print(preview_s),
         Print("  "),
-        Print(age)
+        SetForegroundColor(if selected { C_DIM } else { C_FAINT }),
+        Print(age),
+        ResetColor
     )?;
-
-    // Extend the selection highlight across the rest of the content width.
-    if selected {
-        let used = 12 + title_w + path_w;
-        if cw > used {
-            queue!(stdout, Print(" ".repeat(cw - used)))?;
-        }
-    }
-    queue!(stdout, ResetColor)?;
     Ok(())
 }
 
