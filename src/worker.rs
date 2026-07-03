@@ -4,10 +4,11 @@ use crate::state::{
 };
 use anyhow::{Context, Result};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::mpsc::{self, Sender};
 use std::thread;
@@ -65,6 +66,40 @@ fn run_worker_inner(id: &str) -> Result<()> {
     let mut cmd = CommandBuilder::new(&session.codex);
     cmd.cwd(Path::new(&session.cwd));
     cmd.env("TERM", "xterm-256color");
+    // Consume the first-message prompt exactly once: take() clears it from the
+    // in-memory session so the write_state below persists None and a later
+    // resume/restart won't replay it.
+    let initial_prompt = session.initial_prompt.take();
+    let is_resume = match &session.codex_session_id {
+        Some(codex_session_id) => {
+            cmd.arg("resume");
+            cmd.arg(codex_session_id);
+            true
+        }
+        None => {
+            // Fresh session: hand codex the first message as a positional
+            // prompt so it starts the first turn on spawn (interactive TUI).
+            // codex writes its rollout as soon as that turn begins, which is
+            // what lets the manager capture the path and read accurate status.
+            if let Some(prompt) = &initial_prompt {
+                cmd.arg(prompt);
+            }
+            false
+        }
+    };
+
+    // Snapshot codex's existing rollout files BEFORE spawning, so the watcher
+    // can tell which file this specific child creates. Snapshotting after the
+    // spawn would race: codex can write its rollout file within the few
+    // milliseconds before the watcher thread starts, so it would look
+    // pre-existing and never be detected as new.
+    let codex_sessions_before: Option<HashSet<PathBuf>> = if is_resume {
+        None
+    } else {
+        let mut before = Vec::new();
+        walk_jsonl(&state::codex_sessions_dir(), 0, &mut before);
+        Some(before.into_iter().collect())
+    };
 
     let mut child = pair
         .slave
@@ -96,10 +131,15 @@ fn run_worker_inner(id: &str) -> Result<()> {
             tx.send(WorkerEvent::ChildExit).ok();
         });
     }
+    if let Some(before) = codex_sessions_before {
+        spawn_session_id_watcher(tx.clone(), before);
+    }
 
     let mut attached: Option<(u64, UnixStream)> = None;
     let mut next_client_id = 1_u64;
     let mut stop_requested_at: Option<Instant> = None;
+    let mut last_output_persisted_at: Option<Instant> = None;
+    const OUTPUT_PERSIST_INTERVAL: Duration = Duration::from_secs(2);
 
     loop {
         accept_connections(
@@ -124,8 +164,25 @@ fn run_worker_inner(id: &str) -> Result<()> {
                         attached = None;
                     }
                 }
+                // Coarse busy/idle signal for the manager UI: throttled so a
+                // fast-streaming codex response doesn't turn into a
+                // write_state call per PTY chunk.
+                let should_persist = last_output_persisted_at
+                    .map(|at| at.elapsed() >= OUTPUT_PERSIST_INTERVAL)
+                    .unwrap_or(true);
+                if should_persist {
+                    session.last_output_at = state::now_secs();
+                    state::write_state(&session).ok();
+                    last_output_persisted_at = Some(Instant::now());
+                }
             }
             Ok(WorkerEvent::PtyEof) => {}
+            Ok(WorkerEvent::CodexSessionId { id, path }) => {
+                session.codex_session_id = Some(id);
+                session.codex_rollout_path = Some(path.to_string_lossy().to_string());
+                session.updated_at = state::now_secs();
+                state::write_state(&session).ok();
+            }
             Ok(WorkerEvent::ChildExit) => {
                 session.status = STATUS_EXITED.to_string();
                 session.updated_at = state::now_secs();
@@ -344,6 +401,99 @@ fn signal_child(pid: Option<u32>, signal: libc::c_int) {
     }
 }
 
+// Correlates a freshly-spawned codex child with the rollout file it writes
+// under ~/.codex/sessions/, so a later worker restart can `codex resume
+// <id>` instead of losing the conversation. This format is undocumented and
+// reverse-engineered, so it's deliberately best-effort: on any mismatch we
+// just leave codex_session_id unset and fresh-spawn next time, same as today.
+fn spawn_session_id_watcher(tx: Sender<WorkerEvent>, seen: HashSet<PathBuf>) {
+    thread::spawn(move || {
+        let root = state::codex_sessions_dir();
+        // Generous giveup bound. Normally the file appears within a second or
+        // two of codex startup; this only matters for slow cold starts. When
+        // it is hit (e.g. the codex format differs and no match is ever
+        // found) the cost is just a cheap directory walk every 300ms.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(300));
+            let mut current = Vec::new();
+            walk_jsonl(&root, 0, &mut current);
+            let Some(new_path) = current.into_iter().find(|p| !seen.contains(p)) else {
+                continue;
+            };
+            if let Some(session_id) = extract_codex_session_id(&new_path) {
+                tx.send(WorkerEvent::CodexSessionId {
+                    id: session_id,
+                    path: new_path,
+                })
+                .ok();
+            }
+            return;
+        }
+    });
+}
+
+fn walk_jsonl(dir: &Path, depth: u32, out: &mut Vec<PathBuf>) {
+    if depth > 4 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            walk_jsonl(&path, depth + 1, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+            out.push(path);
+        }
+    }
+}
+
+fn extract_codex_session_id(path: &Path) -> Option<String> {
+    read_session_id_from_jsonl(path).or_else(|| extract_session_id_from_filename(path))
+}
+
+fn read_session_id_from_jsonl(path: &Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    let mut reader = io::BufReader::new(file);
+    let mut first_line = String::new();
+    reader.read_line(&mut first_line).ok()?;
+    let value: serde_json::Value = serde_json::from_str(first_line.trim()).ok()?;
+    for key in ["session_id", "id"] {
+        if let Some(id) = value.get(key).and_then(|v| v.as_str()) {
+            return Some(id.to_string());
+        }
+        if let Some(id) = value
+            .get("payload")
+            .and_then(|p| p.get(key))
+            .and_then(|v| v.as_str())
+        {
+            return Some(id.to_string());
+        }
+    }
+    None
+}
+
+// Falls back to the rollout filename itself: `rollout-<timestamp>-<id>.jsonl`
+// where <timestamp> looks like `2025-01-22T10-30-00`.
+fn extract_session_id_from_filename(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    let rest = stem.strip_prefix("rollout-")?;
+    let t_pos = rest.find('T')?;
+    let after_t = &rest[t_pos + 1..];
+    let mut parts = after_t.splitn(4, '-');
+    parts.next()?; // hour
+    parts.next()?; // minute
+    parts.next()?; // second
+    let id = parts.next()?;
+    if id.is_empty() {
+        None
+    } else {
+        Some(id.to_string())
+    }
+}
+
 fn mark_failed(id: &str, message: &str) {
     if let Ok(mut session) = state::read_state(id) {
         session.status = STATUS_FAILED.to_string();
@@ -357,6 +507,7 @@ fn mark_failed(id: &str, message: &str) {
 enum WorkerEvent {
     PtyOutput(Vec<u8>),
     PtyEof,
+    CodexSessionId { id: String, path: PathBuf },
     ChildExit,
     ClientInput(u64, Vec<u8>),
     ClientResize(u64, u16, u16),

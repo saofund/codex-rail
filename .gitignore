@@ -1,3 +1,8 @@
 /target/
 .DS_Store
 .toolchains/
+.venv/
+__pycache__/
+# Local test renders — several capture real session content; keep out of the
+# public repo. Add curated, fake-session demos explicitly if ever wanted.
+tests/screenshots/

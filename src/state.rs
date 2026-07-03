@@ -31,6 +31,24 @@ pub struct SessionState {
     pub updated_at: u64,
     pub exit_code: Option<i32>,
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub codex_session_id: Option<String>,
+    #[serde(default)]
+    pub codex_rollout_path: Option<String>,
+    // A first message handed to codex on its very first spawn (the composer
+    // input in the "type = first message" flow). Consumed once by the worker,
+    // then cleared so a later resume/restart doesn't replay it. None = plain.
+    #[serde(default)]
+    pub initial_prompt: Option<String>,
+    // Set once the user renames via Ctrl+R. Pins the title so the automatic
+    // "sync from codex's first message" pass leaves their chosen name alone.
+    #[serde(default)]
+    pub title_pinned: bool,
+    // Wall-clock seconds of the last PTY output byte seen. Coarse (updated at
+    // most every couple seconds, see worker.rs) "is something happening"
+    // signal that doesn't require understanding what codex is actually doing.
+    #[serde(default)]
+    pub last_output_at: u64,
 }
 
 pub fn now_secs() -> u64 {
@@ -196,4 +214,48 @@ fn home_dir() -> PathBuf {
     env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+// Where the real `codex` CLI (not codex-rail) keeps its own rollout/session
+// transcripts: <codex-home>/sessions/YYYY/MM/DD/rollout-*.jsonl. Honors
+// CODEX_HOME (which codex itself respects) so an isolated test setup or a
+// non-default codex home is picked up; falls back to ~/.codex. This layout is
+// undocumented/reverse-engineered and may change between codex versions.
+pub fn codex_sessions_dir() -> PathBuf {
+    codex_home_dir().join("sessions")
+}
+
+// Codex's home directory (holds sessions/, history.jsonl, config.toml, ...).
+// Honors CODEX_HOME like codex itself; falls back to ~/.codex.
+pub fn codex_home_dir() -> PathBuf {
+    if let Some(home) = env::var_os("CODEX_HOME") {
+        return PathBuf::from(home);
+    }
+    home_dir().join(".codex")
+}
+
+// Map each codex session_id to its FIRST user message, read from codex's
+// append-only history.jsonl ({session_id, ts, text} per line, in chronological
+// order so the first occurrence wins). Best-effort: any error yields an empty
+// map and callers just keep the title they already have. Undocumented format.
+pub fn codex_first_messages() -> std::collections::HashMap<String, String> {
+    let mut map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let path = codex_home_dir().join("history.jsonl");
+    let Ok(content) = fs::read_to_string(&path) else {
+        return map;
+    };
+    for line in content.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let (Some(sid), Some(text)) = (
+            value.get("session_id").and_then(|s| s.as_str()),
+            value.get("text").and_then(|t| t.as_str()),
+        ) else {
+            continue;
+        };
+        map.entry(sid.to_string())
+            .or_insert_with(|| text.to_string());
+    }
+    map
 }
