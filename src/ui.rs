@@ -355,10 +355,43 @@ fn home_tilde(cwd: &str) -> String {
 pub fn run_manager() -> Result<()> {
     state::ensure_base_dirs()?;
     let mut terminal = TerminalSession::enter()?;
+    spawn_terminal_watchdog();
     let mut app = App::load()?;
     let result = manager_loop(&mut terminal, &mut app);
     terminal.leave().ok();
     result
+}
+
+// True once our controlling terminal has hung up (the pty master closed). A
+// live tty answers TIOCGWINSZ with the window size; a hung-up one fails with
+// EIO (and ENXIO/EBADF as it's torn down). This is a read-only ioctl, so —
+// unlike a read() — it never steals a keystroke from crossterm's input loop.
+fn terminal_is_dead() -> bool {
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::ioctl(libc::STDIN_FILENO, libc::TIOCGWINSZ, &mut ws) };
+    if rc == 0 {
+        return false;
+    }
+    matches!(
+        io::Error::last_os_error().raw_os_error(),
+        Some(libc::EIO) | Some(libc::ENXIO) | Some(libc::EBADF)
+    )
+}
+
+// A tiny watchdog thread. If the terminal dies without a clean quit (SSH drop,
+// window closed, parent shell exits), crossterm's event::read() busy-loops on
+// the dead tty forever and the main loop never regains control — so no check
+// *inside* that loop can save us. This independent thread notices the hangup
+// and force-exits the process, so a manager can never end up as a stray
+// 100%-CPU orphan (this host's PID 1 never reaps, so it would linger for good).
+// The workers it spawned are separate processes and keep running, as intended.
+fn spawn_terminal_watchdog() {
+    thread::spawn(|| loop {
+        thread::sleep(Duration::from_millis(300));
+        if terminal_is_dead() {
+            std::process::exit(0);
+        }
+    });
 }
 
 fn manager_loop(terminal: &mut TerminalSession, app: &mut App) -> Result<()> {

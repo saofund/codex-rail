@@ -113,6 +113,30 @@ class Cockpit:
                 pass
         shutil.rmtree(self.root, ignore_errors=True)
 
+    def cpu_ticks(self):
+        try:
+            f = open(f"/proc/{self.p.pid}/stat").read().split()
+            return int(f[13]) + int(f[14])          # utime+stime, USER_HZ (100/s)
+        except Exception:
+            return None
+
+    def simulate_terminal_death(self):
+        """Close the pty master — as if the SSH session dropped or the window closed."""
+        self.stopped.set()
+        time.sleep(0.15)
+        try:
+            os.close(self.m)
+        except Exception:
+            pass
+
+    def exited_within(self, seconds):
+        end = time.time() + seconds
+        while time.time() < end:
+            if self.p.poll() is not None:
+                return True
+            time.sleep(0.1)
+        return False
+
     def _kill_workers(self):
         if not os.path.isdir(self.jobs):
             return
@@ -480,6 +504,22 @@ def audit(rail, pngdir=None):
         after = len(os.listdir(c.jobs))
         check("space: reserved (no composer, no new session)", not new_mode and after == before,
               f"new_mode={new_mode} dirs {before}->{after}")
+    finally:
+        c.close()
+
+    # 10) terminal death -> manager exits (no 100% CPU orphan)
+    c = Cockpit(rail).boot()
+    try:
+        c.seed("td-0", "TD_ROW", status="exited")
+        time.sleep(0.6)
+        c.simulate_terminal_death()
+        exited = c.exited_within(2.5)
+        detail = "exited cleanly"
+        if not exited:
+            a = c.cpu_ticks(); time.sleep(1.0); b = c.cpu_ticks()
+            per = (b - a) if (a is not None and b is not None) else "?"
+            detail = f"STILL ALIVE, cpu={per}/s (100=full core)"
+        check("terminal death: manager exits, no 100% CPU orphan", exited, detail)
     finally:
         c.close()
 
