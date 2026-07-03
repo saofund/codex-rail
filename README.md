@@ -98,25 +98,29 @@ Design points:
 
 ## Controls
 
-Manager screen:
+Manager screen (the bottom line always shows the relevant keys):
 
-- `w` / `Up`, `s` / `Down`: move selection
-- `Enter` / `Right` / `d`, or mouse click: attach the selected session
+- `↑` / `↓` (or `w` / `s`): move selection
+- `Enter` (or `→` / `d`, or mouse click): attach the selected session
 - `e`, or just start typing: compose a new session — your text becomes codex's
   first message (empty → a blank, auto-numbered session)
-- `Ctrl-R`: rename the selected session (pins the title against auto-sync)
-- `Ctrl-X` twice within 2s: stop the selected session; press it twice again on an
+- `Ctrl+R`: rename the selected session (pins the title against auto-sync)
+- `Ctrl+X` twice within 2s: stop the selected session; press it twice again on an
   already-stopped session to **remove** it from the list (deletes its state, so
   the row finally goes away — the codex transcript on disk is left untouched)
 - `Esc` twice within 2s: leave the manager (sessions keep running)
 - `Space` is reserved for a future feature and does nothing here
 
+Only sections that actually have sessions are shown (an empty *Working* or
+*Needs input* block is hidden rather than drawn as "none"), and the list floats
+to the vertical middle when it fits. Transient status and confirm prompts appear
+on the bottom line, never inside the composer box.
+
 Attached session:
 
-- `Ctrl-Z`: detach back to the manager. codex draws over the whole screen with
-  no room for a persistent status bar, so rail shows this one hint full-screen on
-  your very first attach (and prints it in the manager's footer as `enter attach
-  (^Z back)`) — after that, attaches are instant.
+- `Ctrl+Z`: detach back to the manager. codex draws over the whole screen with
+  no room for a persistent status bar, so rail shows this hint full-screen on
+  your very first attach — after that, attaches are instant.
 - every other key passes through to codex
 
 ## Install

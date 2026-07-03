@@ -274,21 +274,29 @@ def test_f():
     # Point the session at this rollout.
     st = json.load(open(sp)); st["codex_rollout_path"] = rp; write_state(sp, st)
 
-    def wcount(mgr):
+    # Count sessions in a named section. Empty sections are now hidden, so an
+    # absent section reads as None (not 0) — which is exactly how we assert the
+    # session LEFT Working and arrived in Needs input after task_complete.
+    def scount(mgr, name):
         for r in mgr.rows():
-            if "Working" in r:
-                try: return int(r.replace("✻", "").split()[-1])
-                except Exception: return None
+            if name in r:
+                toks = r.replace("✻", " ").replace("●", " ").replace("○", " ").split()
+                for t in reversed(toks):
+                    if t.isdigit():
+                        return int(t)
+                return None
         return None
 
     mgr = Manager(data, run, codex_home=ROOT + "/ch")
     try:
-        time.sleep(1.2); c0 = wcount(mgr)
-        time.sleep(8.0); c8 = wcount(mgr)                 # 8s of silence (> old 6s threshold)
+        time.sleep(1.2); c0 = scount(mgr, "Working")
+        time.sleep(8.0); c8 = scount(mgr, "Working")      # 8s of silence (> old 6s threshold)
         with open(rp, "a") as f: f.write(json.dumps(complete) + "\n")
-        time.sleep(1.5); cf = wcount(mgr)
-        ok = c0 == 1 and c8 == 1 and cf == 0
-        print(f"   Working: t0={c0} t8s(silent)={c8} after_complete={cf}")
+        time.sleep(1.5)
+        wf = scount(mgr, "Working")                       # now empty -> hidden -> None
+        nf = scount(mgr, "Needs input")                   # session moved here -> 1
+        ok = c0 == 1 and c8 == 1 and wf is None and nf == 1
+        print(f"   Working: t0={c0} t8s(silent)={c8} after_complete: Working={wf} NeedsInput={nf}")
         print("   ", "PASS" if ok else "FAIL")
         return ok
     finally:

@@ -609,13 +609,18 @@ fn handle_key(key: KeyEvent, app: &mut App, terminal: &mut TerminalSession) -> R
 }
 
 fn handle_normal_key(key: KeyEvent, app: &mut App, terminal: &mut TerminalSession) -> Result<bool> {
+    // Any fresh keypress clears the previous transient status ("renamed",
+    // "detached", errors, confirm prompts) so it fades on your next action. The
+    // confirm flows below re-set their own message after this clear, so the two
+    // presses of Ctrl+X / Esc still show their prompt in between.
+    app.message.clear();
+
     if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('r') {
         if let Some(session) = app.current() {
             app.input = session.title.clone();
             app.mode = Mode::Rename;
             app.stop_confirm = None;
             app.exit_confirm = None;
-            app.message = "rename session".to_string();
         }
         return Ok(false);
     }
@@ -646,7 +651,6 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, terminal: &mut TerminalSessio
             app.input.clear();
             app.stop_confirm = None;
             app.exit_confirm = None;
-            app.message = "first message · Enter to start · empty = blank".to_string();
         }
         // SPACE is reserved for the upcoming auto-reply toggle. Swallow it here
         // so it doesn't fall through to the "type any key to start a new
@@ -658,7 +662,6 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, terminal: &mut TerminalSessio
             app.input.push(ch);
             app.stop_confirm = None;
             app.exit_confirm = None;
-            app.message = "first message · Enter to start · empty = blank".to_string();
         }
         _ => {}
     }
@@ -804,7 +807,7 @@ fn show_detach_hint_once() {
     let center = |text: &str| cols.saturating_sub(display_width(text) as u16) / 2;
     let cy = rows / 2;
     let l1 = "Attaching to codex \u{2026}";
-    let l2 = "Press  Ctrl-Z  any time to come back to rail.";
+    let l2 = "Press  Ctrl+Z  any time to come back to rail.";
     let mut out = io::stdout();
     let _ = execute!(
         out,
@@ -1136,9 +1139,9 @@ fn stop_with_confirmation(app: &mut App) -> Result<()> {
     if !confirmed {
         app.stop_confirm = Some((session.id, Instant::now()));
         app.message = if live {
-            "Ctrl-X again to stop this session".to_string()
+            "Ctrl+X again to stop this session".to_string()
         } else {
-            "Ctrl-X again to remove this stopped session".to_string()
+            "Ctrl+X again to remove this stopped session".to_string()
         };
         return Ok(());
     }
@@ -1186,7 +1189,7 @@ fn confirm_exit(app: &mut App) -> bool {
     } else {
         app.exit_confirm = Some(Instant::now());
         app.stop_confirm = None;
-        app.message = "Esc again to leave manager".to_string();
+        app.message = "Esc again to quit (sessions keep running)".to_string();
         false
     }
 }
@@ -1225,7 +1228,7 @@ fn render(app: &mut App) -> Result<()> {
     draw_header(&mut frame, cols, app);
     draw_sessions(&mut frame, app, cols, rows);
     draw_input(&mut frame, app, cols, rows);
-    draw_hint(&mut frame, cols, rows);
+    draw_hint(&mut frame, app, cols, rows);
 
     let mut stdout = io::stdout();
     let mut wrote = false;
@@ -1303,7 +1306,6 @@ fn draw_header(frame: &mut [String], cols: u16, app: &App) {
 
 enum DisplayItem {
     Gap,
-    Empty,
     Header(Bucket, usize),
     Row(usize),
 }
@@ -1345,9 +1347,9 @@ fn draw_sessions(frame: &mut [String], app: &mut App, cols: u16, rows: u16) {
     }
 
     // Group session indices by bucket, keeping the global sort order within
-    // each. Then always emit all three sections in a fixed order — even the
-    // empty ones — so the panel keeps a stable shape (like Claude Code's agents
-    // panel) instead of sections appearing and vanishing as statuses change.
+    // each. Emit sections in a fixed order but SKIP any that are empty — an
+    // empty "Working  0 / none" block is just clutter, so a section appears only
+    // when it actually has sessions.
     let mut by_bucket: [Vec<usize>; 3] = [Vec::new(), Vec::new(), Vec::new()];
     for (i, s) in app.sessions.iter().enumerate() {
         by_bucket[bucket_slot(bucket_of(&app.activity, s))].push(i);
@@ -1357,16 +1359,15 @@ fn draw_sessions(frame: &mut [String], app: &mut App, cols: u16, rows: u16) {
         .into_iter()
         .enumerate()
     {
-        if slot > 0 {
+        if by_bucket[slot].is_empty() {
+            continue;
+        }
+        if !items.is_empty() {
             items.push(DisplayItem::Gap);
         }
         items.push(DisplayItem::Header(b, by_bucket[slot].len()));
-        if by_bucket[slot].is_empty() {
-            items.push(DisplayItem::Empty);
-        } else {
-            for &i in &by_bucket[slot] {
-                items.push(DisplayItem::Row(i));
-            }
+        for &i in &by_bucket[slot] {
+            items.push(DisplayItem::Row(i));
         }
     }
 
@@ -1392,13 +1393,6 @@ fn draw_sessions(frame: &mut [String], app: &mut App, cols: u16, rows: u16) {
         let y = render_start_y + visible as u16;
         match item {
             DisplayItem::Gap => put(frame, y, String::new()),
-            DisplayItem::Empty => put(
-                frame,
-                y,
-                styled_line(|b| {
-                    let _ = queue!(b, SetForegroundColor(C_FAINT), Print(fit_cols("       none", cw)));
-                }),
-            ),
             DisplayItem::Header(b, count) => put(frame, y, section_header_line(*b, *count)),
             DisplayItem::Row(index) => {
                 let selected = *index == app.selected;
@@ -1414,21 +1408,9 @@ fn draw_sessions(frame: &mut [String], app: &mut App, cols: u16, rows: u16) {
             }
         }
     }
-
-    // Context line just above the input box: the selected session's full path.
-    // Rows themselves show the latest message, so this keeps "where it runs"
-    // visible for the highlighted session without a per-row path column.
-    if let Some(sel) = app.sessions.get(app.selected) {
-        // Tail-truncate so a long path keeps its meaningful end (…/project).
-        let path = fit_cols_tail(&home_tilde(&sel.cwd), cw.saturating_sub(2));
-        put(
-            frame,
-            box_top.saturating_sub(1),
-            styled_line(|b| {
-                let _ = queue!(b, SetForegroundColor(C_FAINT), Print(fit_cols(&format!("  {path}"), cw)));
-            }),
-        );
-    }
+    // The selected session's working dir used to sit on its own full-width line
+    // here — it overpowered the list. It now rides faintly on the composer's
+    // bottom border (see draw_input), where it's available but out of the way.
 }
 
 // Section header: coloured glyph + name (bold, bucket colour) + dim count.
@@ -1521,16 +1503,24 @@ fn draw_input(frame: &mut [String], app: &App, cols: u16, rows: u16) {
     }
     let inner = box_w - 2; // usable columns between the two side borders
 
-    // Top border. A transient status message rides on it as a box title
-    // (amber), e.g. "╭─ renamed ─────╮"; otherwise it's a plain faint border.
-    let (top, top_color) = if app.message.is_empty() {
-        (format!("╭{}╮", "─".repeat(box_w - 2)), C_ACCENT_DIM)
-    } else {
-        let msg = format!(" {} ", app.message);
-        let msg_w = display_width(&msg).min(box_w.saturating_sub(4));
-        let msg_s = fit_cols(&msg, msg_w);
-        let rest = (box_w - 2).saturating_sub(1 + msg_w);
-        (format!("╭─{}{}╮", msg_s, "─".repeat(rest)), C_NEEDS)
+    // Top border. In compose/rename mode it carries a small mode label as a box
+    // title ("╭─ new session ─╮"); otherwise a plain faint border. Transient
+    // status and confirm messages live on the bottom hint line now, not here —
+    // a quit/stop prompt has no business appearing inside the text box.
+    let label = match app.mode {
+        Mode::New => Some("new session"),
+        Mode::Rename => Some("rename"),
+        Mode::Normal => None,
+    };
+    let (top, top_color) = match label {
+        None => (format!("╭{}╮", "─".repeat(box_w - 2)), C_ACCENT_DIM),
+        Some(l) => {
+            let seg = format!(" {l} ");
+            let seg_w = display_width(&seg).min(box_w.saturating_sub(4));
+            let seg_s = fit_cols(&seg, seg_w);
+            let rest = (box_w - 2).saturating_sub(1 + seg_w);
+            (format!("╭─{}{}╮", seg_s, "─".repeat(rest)), C_ACCENT)
+        }
     };
     put(
         frame,
@@ -1567,35 +1557,69 @@ fn draw_input(frame: &mut [String], app: &App, cols: u16, rows: u16) {
         }),
     );
 
-    // Bottom border.
+    // Bottom border. In Normal mode the selected session's working dir rides
+    // here — faint, right-aligned, tail-truncated — so "where it runs" stays
+    // available without a full line of its own pulling focus off the list.
     put(
         frame,
         box_top + 2,
         styled_line(|b| {
-            let _ = queue!(
-                b,
-                SetForegroundColor(C_ACCENT_DIM),
-                Print(format!("  ╰{}╯", "─".repeat(box_w - 2)))
-            );
+            let _ = queue!(b, SetForegroundColor(C_ACCENT_DIM), Print("  ╰"));
+            let path = if matches!(app.mode, Mode::Normal) {
+                app.sessions.get(app.selected).map(|s| home_tilde(&s.cwd))
+            } else {
+                None
+            };
+            match path {
+                Some(p) => {
+                    let pw = display_width(&p).min(box_w.saturating_sub(6)).min(34);
+                    let ps = fit_cols_tail(&p, pw);
+                    let psw = display_width(&ps);
+                    let left = (box_w - 2).saturating_sub(psw + 2);
+                    let _ = queue!(
+                        b,
+                        Print("─".repeat(left)),
+                        SetForegroundColor(C_FAINT),
+                        Print(format!(" {ps} ")),
+                        SetForegroundColor(C_ACCENT_DIM)
+                    );
+                }
+                None => {
+                    let _ = queue!(b, Print("─".repeat(box_w - 2)));
+                }
+            }
+            let _ = queue!(b, Print("╯"));
         }),
     );
 }
 
-// Compact key hints on the last line, using terse symbols instead of the old
-// full-width "Ctrl-X Ctrl-X" wall of text.
-fn draw_hint(frame: &mut [String], cols: u16, rows: u16) {
-    // Uses the full terminal width and display-width-aware fitting so the "·"
-    // separators (2 bytes each) don't get miscounted and clip the last word.
-    let hint =
-        "w/s move · enter attach (^Z back) · e new · ^R rename · ^X ^X stop/remove · esc esc quit";
+// The bottom line: a transient status/confirm message when there is one,
+// otherwise mode-aware key hints. Keys are written the way most people expect
+// (arrow keys, spelled-out "Ctrl+"/"Esc", "twice" for a double-press) rather
+// than terse ^X/w-s notation.
+fn draw_hint(frame: &mut [String], app: &App, cols: u16, rows: u16) {
+    let (text, color) = if !app.message.is_empty() {
+        (app.message.clone(), C_NEEDS) // status/confirm, amber, stands out
+    } else {
+        let hint = match app.mode {
+            Mode::Normal => {
+                "↑↓ move · Enter attach · e new · Ctrl+R rename · Ctrl+X twice stop · Esc twice quit"
+            }
+            Mode::New => "Enter start · Esc cancel · empty = blank session",
+            Mode::Rename => "Enter save · Esc cancel",
+        };
+        (hint.to_string(), C_DIM)
+    };
+    // Full width + display-width-aware fit so the "·" (2-byte) separators aren't
+    // miscounted and the last word isn't clipped.
     put(
         frame,
         rows.saturating_sub(1),
         styled_line(|b| {
             let _ = queue!(
                 b,
-                SetForegroundColor(C_DIM),
-                Print(fit_cols(&format!("  {hint}"), cols as usize))
+                SetForegroundColor(color),
+                Print(fit_cols(&format!("  {text}"), cols as usize))
             );
         }),
     );

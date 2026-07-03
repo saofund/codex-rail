@@ -372,8 +372,10 @@ def audit(rail, pngdir=None):
         c.seed("seed-0", "SEED_ROW", status="exited")
         time.sleep(1.0)
         counts = c.section_counts()
-        check("sections: all 3 shown once a session exists",
-              set(counts) >= {"Needs input", "Working", "Stopped"}, str(counts))
+        txt = c.text()
+        check("sections: empty ones hidden (1 exited -> only Stopped shows)",
+              "Stopped" in counts and "Needs input" not in txt and "Working" not in txt,
+              str(counts))
         snap(c, "01b_sections")
     finally:
         c.close()
@@ -493,14 +495,14 @@ def audit(rail, pngdir=None):
     finally:
         c.close()
 
-    # 9) Space reserved: does not open the composer ("Enter to start" = New-mode border)
+    # 9) Space reserved: does not open the composer ("Enter start" = New-mode hint)
     c = Cockpit(rail).boot()
     try:
         c.seed("sp-0", "SPACE_ROW", status="exited")
         time.sleep(0.8)
         before = len(os.listdir(c.jobs))
         c.key(b" ", 0.4)
-        new_mode = "Enter to start" in c.text()
+        new_mode = "Enter start" in c.text() or "new session" in c.text()
         after = len(os.listdir(c.jobs))
         check("space: reserved (no composer, no new session)", not new_mode and after == before,
               f"new_mode={new_mode} dirs {before}->{after}")
@@ -555,11 +557,33 @@ def audit(rail, pngdir=None):
         c.seed("mid-0", "MIDDLE_ROW", status="exited")
         time.sleep(1.0)
         rws = c.rows()
-        hdr_idx = next((i for i, r in enumerate(rws) if "Needs input" in r), -1)
+        hdr_idx = next((i for i, r in enumerate(rws)
+                        if any(k in r for k in ("Needs input", "Working", "Stopped"))), -1)
         # top-pinned would sit at row ~3; floated pushes both well down (~15 @ 40 rows)
         check("layout: panel floats to vertical middle when it fits",
-              empty_idx >= 8 and hdr_idx >= 8, f"empty_row={empty_idx} needsinput_row={hdr_idx}")
+              empty_idx >= 8 and hdr_idx >= 8, f"empty_row={empty_idx} section_row={hdr_idx}")
         snap(c, "12_centered")
+    finally:
+        c.close()
+
+    # 13) redesign: Windows-style hints (arrows + spelled Ctrl/Esc) on the status
+    #     line, and a confirm prompt shows THERE — not jammed into the composer box.
+    c = Cockpit(rail).boot()
+    try:
+        c.seed("hint-0", "HINT_ROW", status="exited")
+        time.sleep(0.8)
+        last = c.rows()[-1]
+        win_keys = ("↑↓" in last) and ("Ctrl+R" in last) and ("twice" in last)
+        c.key(b"\x1b", 0.5)                       # one Esc -> arm the quit confirm
+        rows_now = c.rows()
+        status = rows_now[-1]
+        box_area = "\n".join(rows_now[-5:-1])     # the composer box, just above the status line
+        on_status = "Esc again to quit" in status
+        clean_box = "Esc again" not in box_area
+        check("redesign: Win-style hints + confirms on the status line, not in the box",
+              win_keys and on_status and clean_box,
+              f"win_keys={win_keys} on_status={on_status} clean_box={clean_box}")
+        snap(c, "13_redesign")
     finally:
         c.close()
 
