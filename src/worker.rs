@@ -51,7 +51,7 @@ fn run_worker_inner(id: &str) -> Result<()> {
     session.worker_pid = Some(process::id());
     session.status = STATUS_RUNNING.to_string();
     session.updated_at = state::now_secs();
-    state::write_state(&session)?;
+    persist_state(&session)?;
 
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -110,7 +110,7 @@ fn run_worker_inner(id: &str) -> Result<()> {
 
     session.child_pid = child_pid;
     session.updated_at = state::now_secs();
-    state::write_state(&session)?;
+    persist_state(&session)?;
 
     let pty_reader = pair.master.try_clone_reader().context("clone pty reader")?;
     let mut pty_writer = pair.master.take_writer().context("take pty writer")?;
@@ -172,7 +172,7 @@ fn run_worker_inner(id: &str) -> Result<()> {
                     .unwrap_or(true);
                 if should_persist {
                     session.last_output_at = state::now_secs();
-                    state::write_state(&session).ok();
+                    persist_state(&session).ok();
                     last_output_persisted_at = Some(Instant::now());
                 }
             }
@@ -181,12 +181,12 @@ fn run_worker_inner(id: &str) -> Result<()> {
                 session.codex_session_id = Some(id);
                 session.codex_rollout_path = Some(path.to_string_lossy().to_string());
                 session.updated_at = state::now_secs();
-                state::write_state(&session).ok();
+                persist_state(&session).ok();
             }
             Ok(WorkerEvent::ChildExit) => {
                 session.status = STATUS_EXITED.to_string();
                 session.updated_at = state::now_secs();
-                state::write_state(&session).ok();
+                persist_state(&session).ok();
                 fs::remove_file(&session.socket).ok();
                 return Ok(());
             }
@@ -217,7 +217,7 @@ fn run_worker_inner(id: &str) -> Result<()> {
                 if stop_requested_at.is_none() {
                     session.status = STATUS_STOPPING.to_string();
                     session.updated_at = state::now_secs();
-                    state::write_state(&session).ok();
+                    persist_state(&session).ok();
                     signal_child(child_pid, libc::SIGTERM);
                     stop_requested_at = Some(Instant::now());
                 }
@@ -492,6 +492,21 @@ fn extract_session_id_from_filename(path: &Path) -> Option<String> {
     } else {
         Some(id.to_string())
     }
+}
+
+// Persist the worker's runtime view WITHOUT clobbering fields the manager owns
+// and may have changed since this worker loaded its copy — namely the title and
+// its pinned flag (a Ctrl+R rename or an automatic title sync). We re-read the
+// on-disk state and carry those two fields over before writing everything else.
+// Without this, the worker's periodic writes (every couple seconds) revert any
+// rename within a blink, which looks like "rename does nothing".
+fn persist_state(session: &SessionState) -> Result<()> {
+    let mut to_write = session.clone();
+    if let Ok(on_disk) = state::read_state(&session.id) {
+        to_write.title = on_disk.title;
+        to_write.title_pinned = on_disk.title_pinned;
+    }
+    state::write_state(&to_write)
 }
 
 fn mark_failed(id: &str, message: &str) {
