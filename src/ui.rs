@@ -247,9 +247,13 @@ fn bucket_glyph(b: Bucket) -> char {
     }
 }
 
+// Age shown in the right-hand column. Deliberately keyed off updated_at only —
+// the time of the last real state change (start/resume/stop) — NOT
+// last_output_at. A working codex streams to its PTY constantly, and the worker
+// records that every ~2s; folding it in made the age flicker 0→1→2→0 forever on
+// any active session. updated_at ticks up as a steady clock instead.
 fn last_activity_secs(s: &SessionState) -> u64 {
-    let base = s.updated_at.max(s.last_output_at);
-    state::now_secs().saturating_sub(base)
+    state::now_secs().saturating_sub(s.updated_at)
 }
 
 fn format_age(secs: u64) -> String {
