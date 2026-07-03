@@ -28,22 +28,25 @@ panes.
 ## How it works
 
 One **manager** process draws the UI; each session gets its own **worker**
-process. They stay decoupled through three channels — per-session state files,
-a Unix socket for live attach, and codex's own transcript files (read-only).
+process. They stay decoupled through per-session files, a Unix socket for live
+attach, and codex's own transcript files (read-only). Crucially the two
+processes write **disjoint** files: the worker owns `state.json` (runtime), the
+manager owns `label.json` (the title). Nothing they each write can clobber the
+other.
 
 ```
 ┌───────────────────────────────────────────────────────────────┐
 │  rail  (manager — the UI you run with `rail`)                  │
 │   reads every state.json ~700ms → classify / sort / draw       │
 │   handles keys; on attach, bridges your terminal to a worker   │
-└─────────┬───────────────────────────────────────┬─────────────┘
-     read │ state.json                      attach │ Unix socket
-    write │ (create / rename / title-sync)         │ (live I/O)
-          ▼                                         ▼
-  $XDG_DATA_HOME/codex-rail/jobs/<id>/state.json  (one per session)
-          ▲                                         ▲
-    write │ status / codex id / timestamps    PTY  │ input & output
-┌─────────┴───────────────────────────────────────┴─────────────┐
+└──────┬───────────────────────┬──────────────────────┬─────────┘
+  read │ state.json      write │ label.json     attach │ Unix socket
+       │ (status, ids)         │ (title + pin)         │ (live I/O)
+       ▼                       ▼                       ▼
+  jobs/<id>/state.json    jobs/<id>/label.json  (label wins over state's title)
+       ▲                                               ▲
+ write │ status / codex id / timestamps          PTY  │ input & output
+┌──────┴────────────────────────────────────────┴───────────────┐
 │  rail --worker <id>  (one per session; outlives the manager)   │
 │   owns a PTY running real codex; binds the Unix socket         │
 │   captures codex's rollout path + session id; reaps its child  │
@@ -51,7 +54,7 @@ a Unix socket for live attach, and codex's own transcript files (read-only).
                      runs codex (real CLI, in the PTY)
                            │ writes
                            ▼
-   ~/.codex/sessions/.../rollout-*.jsonl   (turn lifecycle → status)
+   ~/.codex/sessions/.../rollout-*.jsonl   (turn lifecycle → status + preview)
    ~/.codex/history.jsonl                  (first message → title sync)
 ```
 
@@ -60,6 +63,14 @@ Design points:
 - **Process isolation.** The manager only reads/writes state files and draws;
   the worker owns the codex process. If the manager dies, sessions keep
   running; if a worker dies, the manager marks it Stopped on its next refresh.
+- **The title can't be clobbered.** A rename (and automatic title sync) writes
+  only `label.json`, which the manager owns; the worker only ever writes
+  `state.json`. Since the label always wins on load, a rename sticks instantly
+  even while an old — or duplicate — worker keeps rewriting `state.json`.
+- **Preview/status self-heal.** If a worker never recorded a rollout path (a
+  session started blank, a slow cold start, an older build), the manager
+  recovers it by matching codex's own `session_meta` cwd and start time, so the
+  row still shows a live status and codex's latest message instead of a bare path.
 - **Status without guessing.** Activity is read from codex's rollout lifecycle
   (`task_started` / `task_complete`), falling back to the rollout file's mtime
   (it grows only while codex is working, never while idle). PTY output timing is
@@ -101,8 +112,10 @@ Set `CODEX_RAIL_CODEX=/path/to/codex` if `codex` is not on `PATH`.
 ## Data layout
 
 - State: `$XDG_DATA_HOME/codex-rail/jobs` (or `~/.local/share/codex-rail/jobs`)
+  - `state.json` — worker-owned runtime (status, codex id, rollout path, pids)
+  - `label.json` — manager-owned title + pin flag (authoritative over the title)
+  - `output.log` — per-session terminal output
 - Sockets: `$XDG_RUNTIME_DIR/codex-rail` (or `/tmp/codex-rail-$UID`)
-- Per-session output log: `output.log` inside each job directory
 
 State and socket files are locked to the owner (`0600`/`0700`).
 

@@ -1,0 +1,6 @@
+{"timestamp":"2026-07-02T13:51:07.000Z","type":"session_meta","payload":{"session_id":"019f2161-87b9-76e2-b7d3-64edc6cda7d1","id":"019f2161-87b9-76e2-b7d3-64edc6cda7d1","timestamp":"2026-07-02T13:51:07.000Z","cwd":"/tmp/rail-fixture-cwd"}}
+{"timestamp":"2026-07-02T13:51:08.000Z","type":"turn_context","payload":{"cwd":"/tmp/rail-fixture-cwd"}}
+{"timestamp":"2026-07-02T13:51:09.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}
+{"timestamp":"2026-07-02T13:51:10.000Z","type":"event_msg","payload":{"type":"user_message","message":"hello fixture","images":[]}}
+{"timestamp":"2026-07-02T13:51:12.000Z","type":"event_msg","payload":{"type":"agent_message","message":"PREVIEW_OK recovered from a real-format rollout","phase":"final_answer"}}
+{"timestamp":"2026-07-02T13:51:12.500Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","last_agent_message":"PREVIEW_OK recovered from a real-format rollout","duration_ms":3000}}

@@ -14,6 +14,7 @@ use crossterm::style::{
 };
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -28,6 +29,12 @@ const EXIT_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
 const REFRESH_INTERVAL: Duration = Duration::from_millis(700);
 const ACTIVITY_IDLE_THRESHOLD_SECS: u64 = 6;
 const ROLLOUT_TAIL_BYTES: u64 = 64 * 1024;
+// When recovering a rollout for a session whose worker never captured one, only
+// accept a codex rollout that started within this window of the session's
+// creation. Real prompted sessions start their rollout within seconds; a wide
+// gap means we're not sure it's the same session, so we leave it unresolved
+// (row falls back to its path) rather than mislabel it.
+const ROLLOUT_MATCH_WINDOW_SECS: u64 = 3600;
 
 // Truecolor palette, tuned for dark terminals. Kept as RGB rather than the
 // 8 legacy ANSI colors so it looks consistent regardless of the user's
@@ -385,12 +392,16 @@ struct App {
     stop_confirm: Option<(String, Instant)>,
     exit_confirm: Option<Instant>,
     rows: Vec<(u16, usize)>,
+    // Memoized rollout recovery per session id: Some(path) once resolved, None
+    // once we've scanned and found no confident match. Keeps the (potentially
+    // large) codex sessions directory from being re-scanned every refresh.
+    rollout_cache: HashMap<String, Option<String>>,
 }
 
 impl App {
     fn load() -> Result<Self> {
         let mut app = Self {
-            sessions: state::load_sessions()?,
+            sessions: Vec::new(),
             selected: 0,
             mode: Mode::Normal,
             input: String::new(),
@@ -398,7 +409,10 @@ impl App {
             stop_confirm: None,
             exit_confirm: None,
             rows: Vec::new(),
+            rollout_cache: HashMap::new(),
         };
+        app.sessions = state::load_sessions()?;
+        resolve_missing_rollouts(&mut app.sessions, &mut app.rollout_cache);
         app.sort_for_display();
         Ok(app)
     }
@@ -406,6 +420,7 @@ impl App {
     fn reload(&mut self) -> Result<()> {
         let selected_id = self.current().map(|s| s.id.clone());
         self.sessions = state::load_sessions()?;
+        resolve_missing_rollouts(&mut self.sessions, &mut self.rollout_cache);
         sync_titles_from_history(&mut self.sessions);
         self.sort_for_display();
         if let Some(id) = selected_id {
@@ -599,13 +614,16 @@ fn submit_input(app: &mut App, terminal: &mut TerminalSession, mode: Mode) -> Re
                 return Ok(());
             }
             if let Some(current) = app.current() {
-                match state::read_state(&current.id).and_then(|mut session| {
-                    session.title = text;
-                    session.title_pinned = true;
-                    session.updated_at = state::now_secs();
-                    state::write_state(&session)
-                }) {
+                // Write ONLY the manager-owned label file. state.json (which the
+                // worker keeps rewriting) is left untouched, so nothing can
+                // revert the rename — label.json is authoritative on load.
+                let id = current.id.clone();
+                match state::write_label(&id, &text, true) {
                     Ok(()) => {
+                        if let Some(s) = app.sessions.iter_mut().find(|s| s.id == id) {
+                            s.title = text.clone();
+                            s.title_pinned = true;
+                        }
                         app.mode = Mode::Normal;
                         app.input.clear();
                         app.message = "renamed".to_string();
@@ -719,6 +737,95 @@ fn relaunch_worker(session: &SessionState) -> Result<()> {
     Ok(())
 }
 
+// Recover a codex rollout path for sessions whose worker never captured one —
+// a blank session (codex writes no rollout until the first turn), a slow cold
+// start that outran the worker's watcher, or a session started by an old rail
+// build. Without a rollout path such rows show neither a real status nor a
+// message preview (they fall back to the cwd), which is the "right side shows
+// the path" bug. We correlate by codex's own session_meta.cwd plus start time
+// (UUIDv7 embeds it): the earliest unclaimed rollout in the session's cwd that
+// began at/after it was created, within a confidence window. Resolved paths are
+// applied to the in-memory session only (used for status + preview); they are
+// never written back, so this cannot re-introduce the manager/worker write race.
+fn resolve_missing_rollouts(
+    sessions: &mut [SessionState],
+    cache: &mut HashMap<String, Option<String>>,
+) {
+    let missing = |s: &SessionState| {
+        s.codex_rollout_path
+            .as_deref()
+            .map(|p| !Path::new(p).exists())
+            .unwrap_or(true)
+    };
+
+    // Only pay for the sessions-dir scan when there's an undecided session.
+    if sessions
+        .iter()
+        .any(|s| missing(s) && !cache.contains_key(&s.id))
+    {
+        // Index every rollout once: (cwd, start_secs, path).
+        let index: Vec<(String, u64, String)> = state::list_rollout_files()
+            .into_iter()
+            .filter_map(|path| {
+                let (cwd, sid) = state::rollout_head(&path)?;
+                let start = state::session_id_start_secs(&sid)?;
+                Some((cwd, start, path.to_string_lossy().to_string()))
+            })
+            .collect();
+
+        // Rollouts already owned by a session that has a path — never reassign.
+        let mut claimed: HashSet<String> = sessions
+            .iter()
+            .filter_map(|s| s.codex_rollout_path.clone())
+            .collect();
+
+        // Resolve oldest-created first so an earlier session gets first pick of
+        // a shared-cwd rollout before a later one can claim it.
+        let mut order: Vec<usize> = (0..sessions.len()).collect();
+        order.sort_by_key(|&i| sessions[i].created_at);
+
+        for i in order {
+            let (id, cwd, created) = {
+                let s = &sessions[i];
+                if !missing(s) || cache.contains_key(&s.id) {
+                    continue;
+                }
+                (s.id.clone(), s.cwd.clone(), s.created_at)
+            };
+            let mut best: Option<(u64, &str)> = None; // (gap, path)
+            for (rcwd, start, path) in &index {
+                if rcwd != &cwd || claimed.contains(path.as_str()) {
+                    continue;
+                }
+                if *start + 5 < created {
+                    continue; // rollout predates the session — not it
+                }
+                let gap = start.saturating_sub(created);
+                if gap > ROLLOUT_MATCH_WINDOW_SECS {
+                    continue;
+                }
+                if best.map(|(g, _)| gap < g).unwrap_or(true) {
+                    best = Some((gap, path.as_str()));
+                }
+            }
+            let chosen = best.map(|(_, p)| p.to_string());
+            if let Some(p) = &chosen {
+                claimed.insert(p.clone());
+            }
+            cache.insert(id, chosen);
+        }
+    }
+
+    // Apply memoized resolutions to the in-memory sessions (display only).
+    for s in sessions.iter_mut() {
+        if missing(s) {
+            if let Some(Some(path)) = cache.get(&s.id) {
+                s.codex_rollout_path = Some(path.clone());
+            }
+        }
+    }
+}
+
 // Refresh titles from codex's own history (the first user message of each
 // session), except where the user pinned a name via Ctrl+R. This is how an
 // auto-numbered "Session N" — or any not-yet-named session — picks up a human
@@ -743,8 +850,10 @@ fn sync_titles_from_history(sessions: &mut [SessionState]) {
         };
         let title = title_from_message(msg);
         if !title.is_empty() && title != s.title {
-            s.title = title;
-            state::write_state(s).ok();
+            s.title = title.clone();
+            // Sync is unpinned by definition; write the manager-owned label so
+            // this never contends with the worker's state.json writes.
+            state::write_label(&s.id, &title, false).ok();
         }
     }
 }
@@ -800,6 +909,9 @@ fn create_session(title: &str, initial_prompt: Option<String>) -> Result<Session
         last_output_at: 0,
     };
     state::write_state(&session)?;
+    // Seed the manager-owned label so the title is authoritative from birth and
+    // the worker's state.json writes never define it.
+    state::write_label(&id, title, false)?;
 
     let mut child = Command::new(env::current_exe().context("current executable")?)
         .arg("--worker")

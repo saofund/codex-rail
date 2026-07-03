@@ -132,7 +132,7 @@ fn run_worker_inner(id: &str) -> Result<()> {
         });
     }
     if let Some(before) = codex_sessions_before {
-        spawn_session_id_watcher(tx.clone(), before);
+        spawn_session_id_watcher(tx.clone(), before, session.cwd.clone());
     }
 
     let mut attached: Option<(u64, UnixStream)> = None;
@@ -406,29 +406,46 @@ fn signal_child(pid: Option<u32>, signal: libc::c_int) {
 // <id>` instead of losing the conversation. This format is undocumented and
 // reverse-engineered, so it's deliberately best-effort: on any mismatch we
 // just leave codex_session_id unset and fresh-spawn next time, same as today.
-fn spawn_session_id_watcher(tx: Sender<WorkerEvent>, seen: HashSet<PathBuf>) {
+fn spawn_session_id_watcher(tx: Sender<WorkerEvent>, seen: HashSet<PathBuf>, cwd: String) {
     thread::spawn(move || {
         let root = state::codex_sessions_dir();
-        // Generous giveup bound. Normally the file appears within a second or
-        // two of codex startup; this only matters for slow cold starts. When
-        // it is hit (e.g. the codex format differs and no match is ever
-        // found) the cost is just a cheap directory walk every 300ms.
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut seen = seen;
+        // Watch for the whole session, not a fixed 30s: a session started blank
+        // (no first message) writes no rollout until the user finally types,
+        // which can be minutes later — the old 30s giveup is exactly why those
+        // sessions ended up with no rollout path and a path-only row. The thread
+        // dies with the worker on codex exit, so this wide bound just caps a
+        // stuck case; a normal prompted session captures within a second or two.
+        let deadline = Instant::now() + Duration::from_secs(6 * 3600);
         while Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(300));
+            thread::sleep(Duration::from_secs(1));
             let mut current = Vec::new();
             walk_jsonl(&root, 0, &mut current);
-            let Some(new_path) = current.into_iter().find(|p| !seen.contains(p)) else {
-                continue;
-            };
-            if let Some(session_id) = extract_codex_session_id(&new_path) {
-                tx.send(WorkerEvent::CodexSessionId {
-                    id: session_id,
-                    path: new_path,
-                })
-                .ok();
+            for path in current {
+                if seen.contains(&path) {
+                    continue;
+                }
+                // A brand-new rollout appeared. Read its header to confirm codex
+                // wrote it for OUR cwd before claiming it — concurrently-starting
+                // sessions each create a rollout, and grabbing the wrong one would
+                // mislabel status/preview. If the header isn't written yet, leave
+                // it unseen and retry next tick rather than skip it forever.
+                let Some((rollout_cwd, _)) = state::rollout_head(&path) else {
+                    continue;
+                };
+                seen.insert(path.clone());
+                if rollout_cwd != cwd {
+                    continue; // belongs to another session
+                }
+                if let Some(session_id) = extract_codex_session_id(&path) {
+                    tx.send(WorkerEvent::CodexSessionId {
+                        id: session_id,
+                        path,
+                    })
+                    .ok();
+                    return;
+                }
             }
-            return;
         }
     });
 }
@@ -494,19 +511,12 @@ fn extract_session_id_from_filename(path: &Path) -> Option<String> {
     }
 }
 
-// Persist the worker's runtime view WITHOUT clobbering fields the manager owns
-// and may have changed since this worker loaded its copy — namely the title and
-// its pinned flag (a Ctrl+R rename or an automatic title sync). We re-read the
-// on-disk state and carry those two fields over before writing everything else.
-// Without this, the worker's periodic writes (every couple seconds) revert any
-// rename within a blink, which looks like "rename does nothing".
+// Persist the worker's runtime view. The user-facing label (title + pin) lives
+// in a separate label.json written only by the manager and is authoritative on
+// load, so the worker never needs to preserve — and cannot clobber — the title.
+// This is what makes a rename stick even against an old or duplicate worker.
 fn persist_state(session: &SessionState) -> Result<()> {
-    let mut to_write = session.clone();
-    if let Ok(on_disk) = state::read_state(&session.id) {
-        to_write.title = on_disk.title;
-        to_write.title_pinned = on_disk.title_pinned;
-    }
-    state::write_state(&to_write)
+    state::write_state(session)
 }
 
 fn mark_failed(id: &str, message: &str) {

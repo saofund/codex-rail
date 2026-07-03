@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
+use std::io::BufRead;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -93,6 +94,10 @@ pub fn log_path(id: &str) -> PathBuf {
     job_dir(id).join("output.log")
 }
 
+pub fn label_path(id: &str) -> PathBuf {
+    job_dir(id).join("label.json")
+}
+
 pub fn runtime_dir() -> PathBuf {
     if let Some(path) = env::var_os("XDG_RUNTIME_DIR") {
         return PathBuf::from(path).join(APP_DIR);
@@ -145,6 +150,45 @@ pub fn write_state(state: &SessionState) -> Result<()> {
     Ok(())
 }
 
+// The session's user-facing label — its title and whether the user pinned it
+// with a rename — lives in its OWN file, written ONLY by the manager. The
+// worker rewrites state.json every couple seconds with its runtime view; if the
+// title lived there too, a manager rename would be clobbered within a blink by
+// any worker still holding a stale copy (exactly the "rename does nothing" bug,
+// which bit hardest with old or duplicate workers that predate the title
+// fields). Splitting the label into a file the worker never touches makes a
+// rename immune to that race by construction. When label.json exists it is
+// authoritative over whatever title happens to sit in state.json.
+#[derive(Serialize, Deserialize)]
+struct Label {
+    title: String,
+    #[serde(default)]
+    title_pinned: bool,
+}
+
+pub fn read_label(id: &str) -> Option<(String, bool)> {
+    let bytes = fs::read(label_path(id)).ok()?;
+    let label: Label = serde_json::from_slice(&bytes).ok()?;
+    Some((label.title, label.title_pinned))
+}
+
+pub fn write_label(id: &str, title: &str, title_pinned: bool) -> Result<()> {
+    let dir = job_dir(id);
+    fs::create_dir_all(&dir).context("create job directory")?;
+    restrict_to_owner(&dir)?;
+    let path = label_path(id);
+    let tmp = path.with_extension("json.tmp");
+    let label = Label {
+        title: title.to_string(),
+        title_pinned,
+    };
+    let bytes = serde_json::to_vec_pretty(&label).context("serialize label")?;
+    fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
+    restrict_file_to_owner(&tmp)?;
+    fs::rename(&tmp, &path).with_context(|| format!("rename {}", path.display()))?;
+    Ok(())
+}
+
 pub fn load_sessions() -> Result<Vec<SessionState>> {
     let mut sessions = Vec::new();
     let dir = jobs_dir();
@@ -166,6 +210,12 @@ pub fn load_sessions() -> Result<Vec<SessionState>> {
             }) {
             Ok(mut state) => {
                 reconcile_liveness(&mut state);
+                // label.json (manager-owned) wins over state.json's title, so a
+                // worker's periodic state writes can never revert a rename.
+                if let Some((title, pinned)) = read_label(&state.id) {
+                    state.title = title;
+                    state.title_pinned = pinned;
+                }
                 sessions.push(state);
             }
             Err(err) => eprintln!("skip broken session state: {err:#}"),
@@ -258,4 +308,63 @@ pub fn codex_first_messages() -> std::collections::HashMap<String, String> {
             .or_insert_with(|| text.to_string());
     }
     map
+}
+
+// codex session ids are UUIDv7, which embed a millisecond unix timestamp in
+// their first 48 bits — so the id alone tells us when codex started that
+// session, no file parse needed. Returns whole seconds. None if it doesn't
+// look like a v7 id. (Verified against real codex 0.142.5 ids: the 12 leading
+// hex digits of `019f25a9-adfd-...` decode to the session's start time.)
+pub fn session_id_start_secs(session_id: &str) -> Option<u64> {
+    let hex: String = session_id.chars().filter(|c| *c != '-').take(12).collect();
+    if hex.len() < 12 {
+        return None;
+    }
+    let ms = u64::from_str_radix(&hex, 16).ok()?;
+    Some(ms / 1000)
+}
+
+// (cwd, session_id) from a rollout's leading `session_meta` line. Used to
+// correlate an orphaned rail session (one whose worker never captured a rollout
+// path — e.g. a blank session, a slow cold start, or an old worker build) with
+// the codex rollout it actually belongs to. Best-effort over the same
+// undocumented rollout format as the rest of the app.
+pub fn rollout_head(path: &Path) -> Option<(String, String)> {
+    let file = fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut first = String::new();
+    reader.read_line(&mut first).ok()?;
+    let value: serde_json::Value = serde_json::from_str(first.trim()).ok()?;
+    let payload = value.get("payload")?;
+    let cwd = payload.get("cwd").and_then(|c| c.as_str())?.to_string();
+    let sid = payload
+        .get("session_id")
+        .or_else(|| payload.get("id"))
+        .and_then(|s| s.as_str())?
+        .to_string();
+    Some((cwd, sid))
+}
+
+// Every rollout JSONL under codex's sessions tree.
+pub fn list_rollout_files() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    walk_rollouts(&codex_sessions_dir(), 0, &mut out);
+    out
+}
+
+fn walk_rollouts(dir: &Path, depth: u32, out: &mut Vec<PathBuf>) {
+    if depth > 4 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            walk_rollouts(&path, depth + 1, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+            out.push(path);
+        }
+    }
 }
