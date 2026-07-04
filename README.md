@@ -113,16 +113,19 @@ Manager screen (the bottom line always shows the relevant keys):
 
 Only sections that actually have sessions are shown (an empty *Working* or
 *Needs input* block is hidden rather than drawn as "none"), and the list floats
-to the vertical middle when it fits. Transient status and confirm prompts appear
-on the bottom line, never inside the composer box.
+to the vertical middle when it fits. The selected session's working directory
+sits faint and right-aligned on the row just above the composer box. Transient
+status and confirm prompts appear on the bottom line, never inside the composer
+box.
 
 Attached session:
 
 - `Ctrl+Z`: detach back to the manager. codex draws over the whole screen with
   no room for a persistent status bar, so before each of your first several
   attaches rail shows a brief full-screen note — with a progress bar that fills
-  as the handoff nears — reminding you of this key; after that it stops and
-  attaches are instant.
+  as the handoff nears — reminding you of this key. The note also says how many
+  more times it will appear, so you know it is temporary; after the last one it
+  stops and attaches are instant.
 - every other key passes through to codex
 
 ## Install

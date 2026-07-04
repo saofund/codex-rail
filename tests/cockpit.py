@@ -537,7 +537,8 @@ def audit(rail, pngdir=None):
         c.new("hello world")                         # create -> first auto-attach
         raw0 = c.raw_since(m0)
         bar = "█".encode()                       # █ — a cell of the progress bar
-        taught = b"come back to rail" in raw0 and bar in raw0  # note + bar shown
+        counted = b"more time" in raw0               # "...show N more time(s), then stop."
+        taught = b"come back to rail" in raw0 and bar in raw0 and counted
         snap(c, "11_detach_hint")
         c.key(b"\x1a", 1.0)                           # detach
         # jump the counter to the cap; the NEXT attach must NOT show the hint
@@ -547,8 +548,8 @@ def audit(rail, pngdir=None):
         c.goto("hello world"); c.key(b"\r", 2.2)      # attach again, now capped
         capped = b"come back to rail" not in c.raw_since(m1)
         c.key(b"\x1a", 0.6)
-        check("detach hint: countdown shown, then stops after the cap",
-              taught and capped, f"taught={taught} stopped_after_cap={capped}")
+        check("detach hint: bar + remaining-count shown, then stops after the cap",
+              taught and capped, f"taught={taught} counted={counted} stopped_after_cap={capped}")
     finally:
         c.close()
 
@@ -589,6 +590,25 @@ def audit(rail, pngdir=None):
               win_keys and on_status and clean_box,
               f"win_keys={win_keys} on_status={on_status} clean_box={clean_box}")
         snap(c, "13_redesign")
+    finally:
+        c.close()
+
+    # 14) path placement: the selected session's cwd floats on the spacer row
+    #     just ABOVE the composer box (faint, right-aligned) — not on the box
+    #     border, where it read as clutter.
+    c = Cockpit(rail).boot()
+    try:
+        c.seed("path-0", "PATH_ROW", status="exited", cwd="/tmp/where-it-runs")
+        time.sleep(1.0)
+        rws = c.rows()
+        above_box = rws[-5]                        # box_top-1: the spacer row
+        bottom_border = rws[-2]                    # box_top+2: composer bottom border
+        on_spacer = "where-it-runs" in above_box
+        off_border = "where-it-runs" not in bottom_border and "╯" in bottom_border
+        check("path: selected cwd floats above the box, not on the border",
+              on_spacer and off_border,
+              f"above={above_box.strip()!r} border_clean={off_border}")
+        snap(c, "14_path_above_box")
     finally:
         c.close()
 

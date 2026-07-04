@@ -826,6 +826,16 @@ fn show_detach_hint() {
     let frame = Duration::from_millis(40); // ~25fps: smooth without thrashing
     let l1 = "Attaching to codex \u{2026}";
     let l2 = "Press  Ctrl+Z  any time to come back to rail.";
+    // Tell the user this note is temporary and counting down, so a first-timer
+    // doesn't assume it will interrupt every single attach forever. `shown` is
+    // this note's 0-based index, so DETACH_HINT_TIMES - (shown+1) is how many
+    // remain after this one.
+    let remaining = DETACH_HINT_TIMES.saturating_sub(shown + 1);
+    let l3 = match remaining {
+        0 => "Last reminder \u{2014} you won't see this again.".to_string(),
+        1 => "This reminder will show 1 more time, then stop.".to_string(),
+        n => format!("This reminder will show {n} more times, then stop."),
+    };
     let style = progress::Style {
         fill: C_ACCENT,
         track: C_FAINT,
@@ -857,6 +867,9 @@ fn show_detach_hint() {
                 SetAttribute(Attribute::Bold),
                 Print(l2),
                 SetAttribute(Attribute::Reset),
+                MoveTo(center(display_width(&l3) as u16), cy + 4),
+                SetForegroundColor(C_FAINT),
+                Print(&l3),
                 ResetColor
             );
             last_size = (cols, rows);
@@ -1602,40 +1615,47 @@ fn draw_input(frame: &mut [String], app: &App, cols: u16, rows: u16) {
         }),
     );
 
-    // Bottom border. In Normal mode the selected session's working dir rides
-    // here — faint, right-aligned, tail-truncated — so "where it runs" stays
-    // available without a full line of its own pulling focus off the list.
+    // Bottom border — plain, mirroring the top. (The selected session's path used
+    // to ride on this border, but sitting on the box chrome read as clutter; it
+    // now floats on the spacer row just ABOVE the box instead — see below.)
     put(
         frame,
         box_top + 2,
         styled_line(|b| {
-            let _ = queue!(b, SetForegroundColor(C_ACCENT_DIM), Print("  ╰"));
-            let path = if matches!(app.mode, Mode::Normal) {
-                app.sessions.get(app.selected).map(|s| home_tilde(&s.cwd))
-            } else {
-                None
-            };
-            match path {
-                Some(p) => {
-                    let pw = display_width(&p).min(box_w.saturating_sub(6)).min(34);
-                    let ps = fit_cols_tail(&p, pw);
-                    let psw = display_width(&ps);
-                    let left = (box_w - 2).saturating_sub(psw + 2);
-                    let _ = queue!(
-                        b,
-                        Print("─".repeat(left)),
-                        SetForegroundColor(C_FAINT),
-                        Print(format!(" {ps} ")),
-                        SetForegroundColor(C_ACCENT_DIM)
-                    );
-                }
-                None => {
-                    let _ = queue!(b, Print("─".repeat(box_w - 2)));
-                }
-            }
-            let _ = queue!(b, Print("╯"));
+            let _ = queue!(
+                b,
+                SetForegroundColor(C_ACCENT_DIM),
+                Print(format!("  ╰{}╯", "─".repeat(box_w - 2)))
+            );
         }),
     );
+
+    // The selected session's working dir rides the blank spacer row just ABOVE
+    // the box — faint and right-aligned, aligned to the box's right edge — so
+    // "where it runs" stays visible without sitting on the border or taking a
+    // full line off the list. Normal mode only; while composing/renaming the row
+    // stays clear (the box title already says what mode you're in).
+    if matches!(app.mode, Mode::Normal) {
+        if let Some(p) = app.sessions.get(app.selected).map(|s| home_tilde(&s.cwd)) {
+            let pw = display_width(&p)
+                .min((cw as usize).saturating_sub(6))
+                .min(40);
+            let ps = fit_cols_tail(&p, pw);
+            let pad = (cw as usize).saturating_sub(display_width(&ps) + 2);
+            put(
+                frame,
+                box_top.saturating_sub(1),
+                styled_line(|b| {
+                    let _ = queue!(
+                        b,
+                        Print(" ".repeat(pad)),
+                        SetForegroundColor(C_FAINT),
+                        Print(ps)
+                    );
+                }),
+            );
+        }
+    }
 }
 
 // The bottom line: a transient status/confirm message when there is one,
