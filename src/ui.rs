@@ -1,4 +1,5 @@
 use crate::attach;
+use crate::progress;
 use crate::state::{
     self, SessionState, STATUS_EXITED, STATUS_FAILED, STATUS_RUNNING, STATUS_STARTING,
     STATUS_STOPPING,
@@ -792,20 +793,20 @@ fn handle_mouse(
     Ok(false)
 }
 
-// Number of attaches over which we keep teaching the detach key, and the
-// countdown length. codex takes over the whole screen with no room for a
-// persistent status bar, and Ctrl+Z's usual meaning (suspend the job) actively
-// misleads — so we teach it with a short countdown shown right before handing
-// off, long enough to actually read. Once was too easy to miss, so we repeat it
-// for the first few attaches, then stop for good.
+// Number of attaches over which we keep teaching the detach key. codex takes
+// over the whole screen with no room for a persistent status bar, and Ctrl+Z's
+// usual meaning (suspend the job) actively misleads — so we teach it right
+// before handing off. Once was too easy to miss, so we repeat it for the first
+// few attaches, then stop for good.
 const DETACH_HINT_TIMES: u32 = 10;
-const DETACH_HINT_COUNT: u32 = 4; // counts 4 -> 1, ~4 seconds
 
 // The one thing a new user genuinely cannot discover on their own: once codex
-// takes over the screen there is nothing on it that says how to get back. We
-// show a full-screen countdown before the first DETACH_HINT_TIMES attaches
-// (tracked in a small counter file), then never again. The per-step delay is
-// overridable via CODEX_RAIL_HINT_MS (the tests set it low to stay fast).
+// takes over the screen there is nothing on it that says how to get back. Before
+// the first DETACH_HINT_TIMES attaches (tracked in a small counter file) we show
+// a short full-screen note with a progress bar that fills as the handoff nears —
+// a bar reads as "loading, please wait" far more naturally than counting a bare
+// number down. The total duration is overridable via CODEX_RAIL_HINT_MS (the
+// tests set it low to stay fast).
 fn show_detach_hint() {
     let flag = state::data_dir().join(".detach_hint_count");
     let shown: u32 = fs::read_to_string(&flag)
@@ -815,43 +816,63 @@ fn show_detach_hint() {
     if shown >= DETACH_HINT_TIMES {
         return;
     }
-    let step = Duration::from_millis(
+    let total = Duration::from_millis(
         env::var("CODEX_RAIL_HINT_MS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(1000),
-    );
+            .unwrap_or(4000),
+    )
+    .max(Duration::from_millis(1));
+    let frame = Duration::from_millis(40); // ~25fps: smooth without thrashing
     let l1 = "Attaching to codex \u{2026}";
     let l2 = "Press  Ctrl+Z  any time to come back to rail.";
+    let style = progress::Style {
+        fill: C_ACCENT,
+        track: C_FAINT,
+    };
     let mut out = io::stdout();
-    for n in (1..=DETACH_HINT_COUNT).rev() {
+    let _ = execute!(out, Hide);
+    let mut last_size = (0u16, 0u16);
+    let start = Instant::now();
+    loop {
+        let elapsed = start.elapsed();
+        // fill() clamps, so an overshoot on the final frame just reads as 100%.
+        let frac = elapsed.as_secs_f64() / total.as_secs_f64();
         let (cols, rows) = terminal::size().unwrap_or((80, 24));
-        let center = |text: &str| cols.saturating_sub(display_width(text) as u16) / 2;
         let cy = rows / 2;
-        let l3 = format!("opening in {n} \u{2026}");
-        let _ = execute!(
-            out,
-            Clear(ClearType::All),
-            MoveTo(center(l1), cy.saturating_sub(2)),
-            SetForegroundColor(C_DIM),
-            Print(l1),
-            MoveTo(center(l2), cy),
-            SetForegroundColor(C_ACCENT),
-            SetAttribute(Attribute::Bold),
-            Print(l2),
-            SetAttribute(Attribute::Reset),
-            MoveTo(center(&l3), cy + 2),
-            SetForegroundColor(C_FAINT),
-            Print(&l3),
-            ResetColor
-        );
+        let center = |w: u16| cols.saturating_sub(w) / 2;
+        let bar_w = 34u16.min(cols.saturating_sub(6)).max(1);
+        // Paint the two static lines once (and again only on resize) so the bar
+        // row is the only thing redrawn each frame — no whole-screen clear per
+        // frame, hence no flicker as the bar animates.
+        if (cols, rows) != last_size {
+            let _ = execute!(
+                out,
+                Clear(ClearType::All),
+                MoveTo(center(display_width(l1) as u16), cy.saturating_sub(2)),
+                SetForegroundColor(C_DIM),
+                Print(l1),
+                MoveTo(center(display_width(l2) as u16), cy),
+                SetForegroundColor(C_ACCENT),
+                SetAttribute(Attribute::Bold),
+                Print(l2),
+                SetAttribute(Attribute::Reset),
+                ResetColor
+            );
+            last_size = (cols, rows);
+        }
+        let bar = progress::render(bar_w, frac, style);
+        let _ = execute!(out, MoveTo(center(bar_w), cy + 2), Print(&bar), ResetColor);
         let _ = out.flush();
-        thread::sleep(step);
+        if elapsed >= total {
+            break;
+        }
+        thread::sleep(frame.min(total - elapsed));
     }
     // Clear the note before handing off: codex renders inline (not in an alt
     // screen) and never clears the screen itself, so without this its first
     // output would draw right under the hint instead of on a clean screen.
-    let _ = execute!(out, ResetColor, Clear(ClearType::All), MoveTo(0, 0));
+    let _ = execute!(out, ResetColor, Show, Clear(ClearType::All), MoveTo(0, 0));
     let _ = out.flush();
     // Count this showing; best-effort — a failure just teaches it again next time.
     let _ = state::ensure_base_dirs();

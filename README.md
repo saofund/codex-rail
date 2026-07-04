@@ -120,8 +120,9 @@ Attached session:
 
 - `Ctrl+Z`: detach back to the manager. codex draws over the whole screen with
   no room for a persistent status bar, so before each of your first several
-  attaches rail shows a brief full-screen countdown reminding you of this key;
-  after that it stops and attaches are instant.
+  attaches rail shows a brief full-screen note — with a progress bar that fills
+  as the handoff nears — reminding you of this key; after that it stops and
+  attaches are instant.
 - every other key passes through to codex
 
 ## Install

@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 mod attach;
+mod progress;
 mod protocol;
 mod state;
 mod ui;
