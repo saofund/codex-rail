@@ -290,6 +290,29 @@ class Cockpit:
         self.wait_until(lambda: self._pid(sid, "child_pid") is not None, timeout=8)
         return sid
 
+    def seed_codex_history(self, n_sessions=2, msgs_each=4):
+        """Write synthetic codex rollouts under HOME/.codex so distillation has
+        real user messages to aggregate (event_msg.user_message lines)."""
+        voice = ["直接开始，别问我，pls just do it, thx",
+                 "这个不对，重新想想，要通用的方案别搞一次性的",
+                 "先 push 再改，我出门了你自己回归测试全程 yes",
+                 "很好，但要测它真的 work，别只说 it should work"]
+        total = 0
+        for si in range(n_sessions):
+            day = f"{(si % 28) + 1:02d}"
+            d = os.path.join(self.home, ".codex", "sessions", "2026", "07", day)
+            os.makedirs(d, exist_ok=True)
+            sid = f"000000{si}-aaaa-bbbb-cccc-0000000000{si}"
+            path = os.path.join(d, f"rollout-2026-07-{day}T12-0{si}-00-{sid}.jsonl")
+            lines = [json.dumps({"type": "session_meta",
+                                 "payload": {"id": sid, "session_id": sid, "cwd": "/tmp"}})]
+            for mi in range(msgs_each):
+                lines.append(json.dumps({"type": "event_msg", "payload": {
+                    "type": "user_message", "message": voice[(si + mi) % len(voice)] + f" (s{si}m{mi})"}}))
+                total += 1
+            open(path, "w", encoding="utf-8").write("\n".join(lines) + "\n")
+        return total
+
     def seed_zombie(self, sid, title):
         z = os.fork()
         if z == 0:
@@ -609,6 +632,39 @@ def audit(rail, pngdir=None):
               on_spacer and off_border,
               f"above={above_box.strip()!r} border_clean={off_border}")
         snap(c, "14_path_above_box")
+    finally:
+        c.close()
+
+    # 15) distill (Ctrl+D): aggregate the user's codex history into a compact,
+    #     codex-readable corpus and launch an AUTONOMOUS codex session to
+    #     summarize their response style. (Fake codex here — this checks rail's
+    #     half: the corpus is built and the session carries the right args.)
+    c = Cockpit(rail).boot()
+    try:
+        c.seed_codex_history(n_sessions=2, msgs_each=4)
+        c.key(b"\x04", 2.5)                        # Ctrl+D
+        corpus = os.path.join(c.home, ".config", "codex-rail", "distill", "corpus")
+        chunks = sorted(glob.glob(corpus + "/corpus-*.md")) if os.path.isdir(corpus) else []
+        made = len(chunks) >= 1
+        shown = "distill" in c.text()              # a distill session is in the list
+        args_ok = False                            # ...and it carries the autonomous flags
+        for d in (os.listdir(c.jobs) if os.path.isdir(c.jobs) else []):
+            try:
+                st = json.load(open(f"{c.jobs}/{d}/state.json"))
+                ca = st.get("codex_args", [])
+                if "distill" in st.get("title", "") and "workspace-write" in ca and "-C" in ca:
+                    args_ok = True
+            except Exception:
+                pass
+        # rail pre-trusts the distill dir in codex's config so the TUI session
+        # doesn't stall on the first-run "trust this folder?" gate.
+        cfg = os.path.join(c.home, ".codex", "config.toml")
+        distill_dir = os.path.join(c.home, ".config", "codex-rail", "distill")
+        trust_ok = os.path.exists(cfg) and f'[projects."{distill_dir}"]' in open(cfg).read()
+        check("distill (Ctrl+D): corpus aggregated + autonomous session + dir pre-trusted",
+              made and shown and args_ok and trust_ok,
+              f"chunks={len(chunks)} shown={shown} args_ok={args_ok} trust_ok={trust_ok}")
+        snap(c, "15_distill")
     finally:
         c.close()
 

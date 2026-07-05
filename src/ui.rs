@@ -1,4 +1,5 @@
 use crate::attach;
+use crate::distill;
 use crate::progress;
 use crate::state::{
     self, SessionState, STATUS_EXITED, STATUS_FAILED, STATUS_RUNNING, STATUS_STARTING,
@@ -20,7 +21,7 @@ use std::env;
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -631,6 +632,13 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, terminal: &mut TerminalSessio
         return Ok(false);
     }
 
+    // Ctrl+D — archive distillation: launch a codex session that reads your past
+    // messages and writes a versioned summary of your response style.
+    if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('d') {
+        start_distillation(app)?;
+        return Ok(false);
+    }
+
     match key.code {
         KeyCode::Up | KeyCode::Char('w') if key.modifiers.is_empty() => app.move_prev(),
         KeyCode::Down | KeyCode::Char('s') if key.modifiers.is_empty() => app.move_next(),
@@ -1107,9 +1115,83 @@ fn default_session_title(sessions: &[SessionState]) -> String {
 }
 
 fn create_session(title: &str, initial_prompt: Option<String>) -> Result<SessionState> {
+    create_session_in(title, initial_prompt, None, Vec::new())
+}
+
+// Ctrl+D — archive distillation. Aggregate the user's own past codex messages
+// into a small, fully-readable corpus (fast, ~1s), then launch a codex session
+// whose cwd is that corpus dir and whose first message tells it to read all of
+// it and write a versioned style-vNNN.md. The session runs autonomously
+// (workspace-write + a trust override so it never stops for approval) and is
+// NOT auto-attached — it shows up like any other session; attach to watch.
+fn start_distillation(app: &mut App) -> Result<()> {
+    app.message = "Preparing distillation \u{2026} reading your codex history".to_string();
+    let _ = render(app); // paint the status before the brief blocking scan
+
+    let prep = match distill::prepare() {
+        Ok(p) => p,
+        Err(err) => {
+            app.message = format!("distill failed: {err:#}");
+            return Ok(());
+        }
+    };
+    if prep.messages == 0 {
+        app.message = "no codex history found to distill".to_string();
+        return Ok(());
+    }
+
+    // codex runs in the corpus dir and only reads/writes there. `-a never -s
+    // workspace-write` keeps it autonomous inside that dir; pre-trusting the dir
+    // in codex's config (below) stops its first-run "trust this folder?" gate
+    // from stalling an unattended run. Best-effort — if the trust write fails the
+    // session still works, it just waits once for the user to approve.
+    let _ = distill::ensure_trusted(&prep.workdir);
+    let workdir = prep.workdir.to_string_lossy().to_string();
+    let codex_args = vec![
+        "-C".to_string(),
+        workdir.clone(),
+        "-s".to_string(),
+        "workspace-write".to_string(),
+        "-a".to_string(),
+        "never".to_string(),
+    ];
+    let title = format!("distill: response style v{:03}", prep.version);
+    let prompt = distill::distill_prompt(&prep);
+
+    match create_session_in(&title, Some(prompt), Some(prep.workdir.clone()), codex_args) {
+        Ok(session) => {
+            app.reload()?;
+            if let Some(pos) = app.sessions.iter().position(|s| s.id == session.id) {
+                app.selected = pos;
+            }
+            app.message = format!(
+                "distilling your style \u{2192} {} ({} sessions, {} chunks) \u{00b7} Enter to watch",
+                prep.output_file, prep.sessions, prep.chunks.len()
+            );
+        }
+        Err(err) => {
+            app.message = format!("distill launch failed: {err:#}");
+        }
+    }
+    Ok(())
+}
+
+// Full form: `cwd_override` pins the session's working directory (else the
+// manager's cwd) and `codex_args` are extra flags spliced in before codex's
+// prompt/resume args. The distill launcher uses both; ordinary sessions call
+// the thin `create_session` wrapper above.
+fn create_session_in(
+    title: &str,
+    initial_prompt: Option<String>,
+    cwd_override: Option<PathBuf>,
+    codex_args: Vec<String>,
+) -> Result<SessionState> {
     state::ensure_base_dirs()?;
     let id = state::new_session_id();
-    let cwd = env::current_dir().context("current directory")?;
+    let cwd = match cwd_override {
+        Some(p) => p,
+        None => env::current_dir().context("current directory")?,
+    };
     let codex = env::var("CODEX_RAIL_CODEX").unwrap_or_else(|_| "codex".to_string());
     let socket = state::socket_path(&id);
     let now = state::now_secs();
@@ -1132,6 +1214,7 @@ fn create_session(title: &str, initial_prompt: Option<String>) -> Result<Session
         initial_prompt,
         title_pinned: false,
         last_output_at: 0,
+        codex_args,
     };
     state::write_state(&session)?;
     // Seed the manager-owned label so the title is authoritative from birth and
@@ -1668,7 +1751,7 @@ fn draw_hint(frame: &mut [String], app: &App, cols: u16, rows: u16) {
     } else {
         let hint = match app.mode {
             Mode::Normal => {
-                "↑↓ move · Enter attach · e new · Ctrl+R rename · Ctrl+X twice stop · Esc twice quit"
+                "↑↓ move · Enter attach · e new · Ctrl+R rename · Ctrl+X twice stop · Ctrl+D distill · Esc twice quit"
             }
             Mode::New => "Enter start · Esc cancel · empty = blank session",
             Mode::Rename => "Enter save · Esc cancel",

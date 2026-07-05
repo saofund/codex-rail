@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 mod attach;
+mod distill;
 mod progress;
 mod protocol;
 mod state;
@@ -25,6 +26,28 @@ fn main() -> Result<()> {
         }
         Some("--version") | Some("-V") => {
             println!("rail {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        // Diagnostic/headless: aggregate the archive corpus without launching a
+        // codex session, and print the plan (used by tests and for timing).
+        Some("--distill-prepare") => {
+            let prep = distill::prepare()?;
+            // Also drop the exact prompt the UI would launch codex with, so a
+            // headless/real-codex test can drive the same thing.
+            let prompt_path = prep.workdir.join(".last-distill-prompt.txt");
+            let _ = std::fs::write(&prompt_path, distill::distill_prompt(&prep));
+            println!(
+                "distill: {} sessions, {} messages -> {} chunk(s) in {}/corpus",
+                prep.sessions,
+                prep.messages,
+                prep.chunks.len(),
+                prep.workdir.display()
+            );
+            println!("next output: {}/{}", prep.workdir.display(), prep.output_file);
+            println!("prompt: {}", prompt_path.display());
+            for c in &prep.chunks {
+                println!("  {} id={}", c.file, c.marker);
+            }
             Ok(())
         }
         Some(other) => {

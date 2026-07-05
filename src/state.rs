@@ -50,6 +50,11 @@ pub struct SessionState {
     // signal that doesn't require understanding what codex is actually doing.
     #[serde(default)]
     pub last_output_at: u64,
+    // Extra CLI args passed to codex BEFORE the prompt/resume args on every
+    // spawn (e.g. a distill session sets `-C <dir> -s workspace-write` and a
+    // trust override so it runs autonomously). Empty for ordinary sessions.
+    #[serde(default)]
+    pub codex_args: Vec<String>,
 }
 
 pub fn now_secs() -> u64 {
@@ -103,6 +108,24 @@ pub fn runtime_dir() -> PathBuf {
         return PathBuf::from(path).join(APP_DIR);
     }
     std::env::temp_dir().join(format!("{}-{}", APP_DIR, unsafe { libc::geteuid() }))
+}
+
+// User config dir ($XDG_CONFIG_HOME/codex-rail or ~/.config/codex-rail). Holds
+// durable, user-facing artifacts kept separate from the runtime job state under
+// data_dir() — currently the versioned distilled-style summaries.
+pub fn config_dir() -> PathBuf {
+    if let Some(path) = env::var_os("XDG_CONFIG_HOME") {
+        return PathBuf::from(path).join(APP_DIR);
+    }
+    home_dir().join(".config").join(APP_DIR)
+}
+
+// Working root for archive distillation: the versioned `style-vNNN.md` summaries
+// live here, and `corpus/` holds the freshly-aggregated, codex-readable chunks
+// (regenerated every run). Also the cwd of the launched distill codex session,
+// so codex only ever reads/writes inside this dir (never ~/.codex directly).
+pub fn distill_dir() -> PathBuf {
+    config_dir().join("distill")
 }
 
 pub fn socket_path(id: &str) -> PathBuf {

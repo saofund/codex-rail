@@ -66,6 +66,12 @@ fn run_worker_inner(id: &str) -> Result<()> {
     let mut cmd = CommandBuilder::new(&session.codex);
     cmd.cwd(Path::new(&session.cwd));
     cmd.env("TERM", "xterm-256color");
+    // Extra flags (e.g. a distill session's `-C <dir> -s workspace-write` plus a
+    // trust override) go BEFORE the prompt/resume args so codex parses them as
+    // options. Empty for ordinary sessions.
+    for a in &session.codex_args {
+        cmd.arg(a);
+    }
     // Consume the first-message prompt exactly once: take() clears it from the
     // in-memory session so the write_state below persists None and a later
     // resume/restart won't replay it.

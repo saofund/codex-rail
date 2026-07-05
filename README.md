@@ -108,6 +108,8 @@ Manager screen (the bottom line always shows the relevant keys):
 - `Ctrl+X` twice within 2s: stop the selected session; press it twice again on an
   already-stopped session to **remove** it from the list (deletes its state, so
   the row finally goes away — the codex transcript on disk is left untouched)
+- `Ctrl+D`: distill your response style from your past codex conversations
+  (see below)
 - `Esc` twice within 2s: leave the manager (sessions keep running)
 - `Space` is reserved for a future feature and does nothing here
 
@@ -128,6 +130,28 @@ Attached session:
   stops and attaches are instant.
 - every other key passes through to codex
 
+## Distill your style
+
+`Ctrl+D` in the manager kicks off **archive distillation**: rail reads back
+through your past codex conversations and launches a codex session that
+summarizes *how you write* — your voice, how you give instructions and
+feedback, your recurring phrases — into a versioned
+`~/.config/codex-rail/distill/style-vNNN.md`.
+
+Because the raw transcripts are hundreds of MB (re-injected context, tool
+output, reasoning), rail first extracts just your own messages into a small,
+**fully readable** corpus of numbered chunks under
+`~/.config/codex-rail/distill/corpus/`. The launched codex session is told to
+read every chunk end-to-end (not grep or sample) and to echo back a marker from
+each one, so a complete read is verifiable rather than assumed. It runs
+autonomously in that directory and shows up like any other session — attach to
+watch it work, or leave it and check `style-vNNN.md` when it lands. Each run
+writes the next version number, so your style profile can be re-distilled and
+compared over time. (Everything stays local under `~/.config/codex-rail`.)
+
+This is the first piece of a larger self-distillation feature. Prompts are
+English-only for now.
+
 ## Install
 
 ```sh
@@ -144,6 +168,9 @@ Set `CODEX_RAIL_CODEX=/path/to/codex` if `codex` is not on `PATH`.
   - `label.json` — manager-owned title + pin flag (authoritative over the title)
   - `output.log` — per-session terminal output
 - Sockets: `$XDG_RUNTIME_DIR/codex-rail` (or `/tmp/codex-rail-$UID`)
+- Distillation: `$XDG_CONFIG_HOME/codex-rail/distill` (or `~/.config/codex-rail/distill`)
+  - `style-vNNN.md` — the versioned distilled style summaries
+  - `corpus/` — the aggregated, codex-readable message chunks (regenerated each run)
 
 State and socket files are locked to the owner (`0600`/`0700`).
 
