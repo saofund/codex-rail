@@ -196,12 +196,15 @@ pub fn prepare() -> Result<DistillPrep> {
             c
         };
         let block = format_convo(c, idx, cap, lead);
+        // Count the user turns that ACTUALLY land in the corpus (a very long
+        // session is clipped to a head+tail arc), so the reported number matches
+        // what the codex session reads and echoes back — not the pre-clip total.
+        user_msgs += block.lines().filter(|l| l.starts_with("> ")).count();
         if take_codex {
             cx_bytes += block.len();
         } else {
             cl_bytes += block.len();
         }
-        user_msgs += c.user_turns();
         body_blocks.push(block);
     }
     let included = body_blocks.len();
