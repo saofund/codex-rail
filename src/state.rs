@@ -55,6 +55,12 @@ pub struct SessionState {
     // trust override so it runs autonomously). Empty for ordinary sessions.
     #[serde(default)]
     pub codex_args: Vec<String>,
+    // Set when this session is an archive-distillation run: the style version it
+    // is producing. Drives its distinct list label ("[distill vN]") and its
+    // "Done" status (vs. an ordinary session's "Needs input") once the style file
+    // lands. None for ordinary sessions.
+    #[serde(default)]
+    pub distill_version: Option<u32>,
 }
 
 pub fn now_secs() -> u64 {
@@ -347,6 +353,14 @@ fn home_dir() -> PathBuf {
 // undocumented/reverse-engineered and may change between codex versions.
 pub fn codex_sessions_dir() -> PathBuf {
     codex_home_dir().join("sessions")
+}
+
+// Claude Code stores its session transcripts as one .jsonl per session, under
+// per-project directories: ~/.claude/projects/<project-slug>/<uuid>.jsonl.
+// Distillation reads these as a second corpus source (alongside codex rollouts)
+// so it can learn the user's reasoning across both tools.
+pub fn claude_projects_dir() -> PathBuf {
+    home_dir().join(".claude").join("projects")
 }
 
 // Codex's home directory (holds sessions/, history.jsonl, config.toml, ...).

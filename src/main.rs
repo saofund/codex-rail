@@ -37,10 +37,14 @@ fn main() -> Result<()> {
             let prompt_path = prep.workdir.join(".last-distill-prompt.txt");
             let _ = std::fs::write(&prompt_path, distill::distill_prompt(&prep));
             println!(
-                "distill: {} sessions, {} messages -> {} chunk(s) in {}/corpus",
+                "distill: {} sessions ({} codex + {} claude) · {} user turns · {} chunk(s) · scanned {} files, {} rich sessions available -> {}/corpus",
                 prep.sessions,
+                prep.codex_sessions,
+                prep.claude_sessions,
                 prep.messages,
                 prep.chunks.len(),
+                prep.scanned,
+                prep.available,
                 prep.workdir.display()
             );
             println!("next output: {}/{}", prep.workdir.display(), prep.output_file);

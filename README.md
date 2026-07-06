@@ -108,8 +108,8 @@ Manager screen (the bottom line always shows the relevant keys):
 - `Ctrl+X` twice within 2s: stop the selected session; press it twice again on an
   already-stopped session to **remove** it from the list (deletes its state, so
   the row finally goes away — the codex transcript on disk is left untouched)
-- `Ctrl+D`: distill your response style from your past codex conversations
-  (see below)
+- `Ctrl+D`: distill your response style **and problem-solving logic** from your
+  past codex *and* Claude Code conversations (see below)
 - `Esc` twice within 2s: leave the manager (sessions keep running)
 - `Space` is reserved for a future feature and does nothing here
 
@@ -127,30 +127,40 @@ Attached session:
   attaches rail shows a brief full-screen note — with a progress bar that fills
   as the handoff nears — reminding you of this key. The note also says how many
   more times it will appear, so you know it is temporary; after the last one it
-  stops and attaches are instant.
+  stops and attaches are instant. (The note is drawn in its own alternate screen
+  buffer, so re-attaching never clears or clobbers codex's screen.)
 - every other key passes through to codex
 
-## Distill your style
+## Distill your style *and logic*
 
 `Ctrl+D` in the manager kicks off **archive distillation**: rail reads back
-through your past codex conversations and launches a codex session that
-summarizes *how you write* — your voice, how you give instructions and
-feedback, your recurring phrases — into a versioned
+through your past conversations — from **both** codex (`~/.codex/sessions`) and
+Claude Code (`~/.claude/projects`) — and launches a codex session that profiles
+not just *how you write* (voice, instructions, feedback, recurring phrases) but
+*how you think*: how you diagnose problems, what makes you approve vs. push back,
+how you drive a task from opening to done. The result is a versioned
 `~/.config/codex-rail/distill/style-vNNN.md`.
 
-Because the raw transcripts are hundreds of MB (re-injected context, tool
-output, reasoning), rail first extracts just your own messages into a small,
-**fully readable** corpus of numbered chunks under
+The key is **context**: rather than dumping your messages in isolation, rail
+keeps each of your turns next to a compressed lead-in of what the assistant had
+just said or done, so the distiller can see *why* you steered the way you did.
+The raw transcripts are huge (hundreds of MB of codex, GBs of Claude, mostly
+re-injected context and tool output), so rail ranks your richest sessions and
+packs them into a small, **fully readable** corpus of numbered chunks under
 `~/.config/codex-rail/distill/corpus/`. The launched codex session is told to
-read every chunk end-to-end (not grep or sample) and to echo back a marker from
-each one, so a complete read is verifiable rather than assumed. It runs
-autonomously in that directory and shows up like any other session — attach to
-watch it work, or leave it and check `style-vNNN.md` when it lands. Each run
-writes the next version number, so your style profile can be re-distilled and
-compared over time. (Everything stays local under `~/.config/codex-rail`.)
+read every chunk end-to-end (not grep or sample) and echo back a marker from
+each, so a complete read is verifiable rather than assumed.
 
-This is the first piece of a larger self-distillation feature. Prompts are
-English-only for now.
+The scan runs on a background thread — the manager stays live and shows a
+"Preparing … Ns" status while it works — then launches a session tagged
+**`[distill vN]`**. It shows an elapsed-time / rough-ETA hint while running and
+flips to a **Done** status once `style-vNNN.md` lands (it's a one-shot task, not
+a chat waiting on you). Attach to watch it, or just check the file. Each run
+writes the next version number, so your profile can be re-distilled and compared
+over time. (Everything stays local under `~/.config/codex-rail` and is never
+committed.)
+
+Prompts are English-only for now.
 
 ## Install
 

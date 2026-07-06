@@ -23,6 +23,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -55,6 +56,7 @@ const C_FAINT: Color = Color::Rgb { r: 96, g: 102, b: 120 }; // rules
 const C_SEL_BG: Color = Color::Rgb { r: 42, g: 38, b: 46 }; // selected row background (warm-tinted)
 const C_NEEDS: Color = Color::Rgb { r: 236, g: 188, b: 92 }; // amber
 const C_WORKING: Color = Color::Rgb { r: 122, g: 208, b: 142 }; // green
+const C_DONE: Color = Color::Rgb { r: 100, g: 200, b: 210 }; // teal: finished task
 const C_STOPPED: Color = Color::Rgb { r: 140, g: 148, b: 168 }; // grey (readable, not "black")
 
 // Cap the content region so age/metadata sit in a tidy column instead of
@@ -190,6 +192,7 @@ fn preview_line(s: &str) -> String {
 enum Bucket {
     NeedsInput,
     Working,
+    Done,
     Stopped,
 }
 
@@ -197,13 +200,30 @@ enum Bucket {
 // App::refresh_activity). Reading it from a map keeps draw/sort pure — no
 // rollout I/O happens while rendering, only when state is refreshed.
 fn bucket_of(activity: &HashMap<String, Activity>, s: &SessionState) -> Bucket {
-    match s.status.as_str() {
+    let base = match s.status.as_str() {
         STATUS_RUNNING => match activity.get(&s.id).copied().unwrap_or(Activity::Waiting) {
             Activity::Waiting => Bucket::NeedsInput,
             Activity::Active => Bucket::Working,
         },
         STATUS_STARTING | STATUS_STOPPING => Bucket::Working,
         _ => Bucket::Stopped, // exited, failed, unknown
+    };
+    // A distillation is a one-shot TASK, not a chat: once its style file has
+    // landed and it's no longer actively working, it reads as "Done", not "Needs
+    // input" (it isn't waiting on you) nor "Stopped" (it succeeded).
+    if s.distill_version.is_some() && !matches!(base, Bucket::Working) && distill_done(s) {
+        return Bucket::Done;
+    }
+    base
+}
+
+// Has this distill session's output file been written yet?
+fn distill_done(s: &SessionState) -> bool {
+    match s.distill_version {
+        Some(v) => state::distill_dir()
+            .join(format!("style-v{v:03}.md"))
+            .exists(),
+        None => false,
     }
 }
 
@@ -211,17 +231,19 @@ fn bucket_rank(b: Bucket) -> u8 {
     match b {
         Bucket::NeedsInput => 0, // things needing your attention float to the top
         Bucket::Working => 1,
-        Bucket::Stopped => 2,
+        Bucket::Done => 2,
+        Bucket::Stopped => 3,
     }
 }
 
 // Fixed slot index for each bucket, used to always lay the sections out in the
-// same order (Needs input / Working / Stopped) whether or not they're empty.
+// same order (Needs input / Working / Done / Stopped) whether or not they're empty.
 fn bucket_slot(b: Bucket) -> usize {
     match b {
         Bucket::NeedsInput => 0,
         Bucket::Working => 1,
-        Bucket::Stopped => 2,
+        Bucket::Done => 2,
+        Bucket::Stopped => 3,
     }
 }
 
@@ -229,6 +251,7 @@ fn bucket_title(b: Bucket) -> &'static str {
     match b {
         Bucket::NeedsInput => "Needs input",
         Bucket::Working => "Working",
+        Bucket::Done => "Done",
         Bucket::Stopped => "Stopped",
     }
 }
@@ -237,6 +260,7 @@ fn bucket_color(b: Bucket) -> Color {
     match b {
         Bucket::NeedsInput => C_NEEDS,
         Bucket::Working => C_WORKING,
+        Bucket::Done => C_DONE,
         Bucket::Stopped => C_STOPPED,
     }
 }
@@ -245,7 +269,8 @@ fn bucket_glyph(b: Bucket) -> char {
     match b {
         Bucket::NeedsInput => '●', // filled amber: wants your attention
         Bucket::Working => '✻',    // busy
-        Bucket::Stopped => '○',    // hollow: inactive/done
+        Bucket::Done => '✓',       // finished task, product delivered
+        Bucket::Stopped => '○',    // hollow: inactive
     }
 }
 
@@ -407,6 +432,12 @@ fn manager_loop(terminal: &mut TerminalSession, app: &mut App) -> Result<()> {
             render(app)?;
         }
 
+        // A background distillation prep may have finished (launch the session) or
+        // still be running (tick its elapsed-time status). Repaint if it changed.
+        if app.distill.is_some() && poll_distillation(app)? {
+            render(app)?;
+        }
+
         if !event::poll(Duration::from_millis(80))? {
             continue;
         }
@@ -462,6 +493,18 @@ struct App {
     // Previous rendered frame, one string per screen row, for diff-based
     // drawing (only changed rows are rewritten — no full clear, no flicker).
     prev_frame: Vec<String>,
+    // In-flight archive-distillation prep. Scanning the codex + Claude archives
+    // takes several seconds, so it runs on a worker thread; the manager loop
+    // polls this each tick, shows an elapsed-time status, and launches the codex
+    // session once the corpus is ready — the UI never freezes.
+    distill: Option<DistillJob>,
+}
+
+// A background `distill::prepare()` in flight: the channel it will deliver on,
+// and when it started (for the elapsed-time status).
+struct DistillJob {
+    rx: mpsc::Receiver<Result<distill::DistillPrep>>,
+    started: Instant,
 }
 
 impl App {
@@ -480,6 +523,7 @@ impl App {
             lifecycle: HashMap::new(),
             preview: HashMap::new(),
             prev_frame: Vec::new(),
+            distill: None,
         };
         app.sessions = state::load_sessions()?;
         resolve_missing_rollouts(&mut app.sessions, &mut app.rollout_cache);
@@ -632,10 +676,10 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, terminal: &mut TerminalSessio
         return Ok(false);
     }
 
-    // Ctrl+D — archive distillation: launch a codex session that reads your past
-    // messages and writes a versioned summary of your response style.
+    // Ctrl+D — archive distillation: kick off a background scan of your codex +
+    // Claude history; the manager loop launches the codex session once it's ready.
     if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('d') {
-        start_distillation(app)?;
+        start_distillation(app);
         return Ok(false);
     }
 
@@ -849,7 +893,14 @@ fn show_detach_hint() {
         track: C_FAINT,
     };
     let mut out = io::stdout();
-    let _ = execute!(out, Hide);
+    // Draw the hint in its OWN alternate screen so it never touches the screen
+    // codex is using. Leaving the alt buffer restores codex's screen exactly as
+    // it was. This is what fixes the 2nd+-attach occlusion: we used to Clear(All)
+    // codex's real screen here, but the worker only replays a raw output *tail*
+    // on attach (worker.rs send_log_tail), not a full repaint — so a reattached
+    // codex, whose recent output is partial updates rather than a whole frame,
+    // came back with holes. Own-buffer = codex's screen is never wiped.
+    let _ = execute!(out, EnterAlternateScreen, Clear(ClearType::All), Hide);
     let mut last_size = (0u16, 0u16);
     let start = Instant::now();
     loop {
@@ -890,10 +941,11 @@ fn show_detach_hint() {
         }
         thread::sleep(frame.min(total - elapsed));
     }
-    // Clear the note before handing off: codex renders inline (not in an alt
-    // screen) and never clears the screen itself, so without this its first
-    // output would draw right under the hint instead of on a clean screen.
-    let _ = execute!(out, ResetColor, Show, Clear(ClearType::All), MoveTo(0, 0));
+    // Leave our alternate screen: the terminal restores codex's primary screen
+    // untouched (on a reattach, exactly what it showed before the hint), then the
+    // worker replays its output tail on top. We deliberately do NOT Clear codex's
+    // real screen here — that clear, against a tail-only replay, was the occlusion.
+    let _ = execute!(out, ResetColor, Show, LeaveAlternateScreen);
     let _ = out.flush();
     // Count this showing; best-effort — a failure just teaches it again next time.
     let _ = state::ensure_base_dirs();
@@ -1115,7 +1167,7 @@ fn default_session_title(sessions: &[SessionState]) -> String {
 }
 
 fn create_session(title: &str, initial_prompt: Option<String>) -> Result<SessionState> {
-    create_session_in(title, initial_prompt, None, Vec::new())
+    create_session_in(title, initial_prompt, None, Vec::new(), None)
 }
 
 // Ctrl+D — archive distillation. Aggregate the user's own past codex messages
@@ -1124,56 +1176,107 @@ fn create_session(title: &str, initial_prompt: Option<String>) -> Result<Session
 // it and write a versioned style-vNNN.md. The session runs autonomously
 // (workspace-write + a trust override so it never stops for approval) and is
 // NOT auto-attached — it shows up like any other session; attach to watch.
-fn start_distillation(app: &mut App) -> Result<()> {
-    app.message = "Preparing distillation \u{2026} reading your codex history".to_string();
-    let _ = render(app); // paint the status before the brief blocking scan
-
-    let prep = match distill::prepare() {
-        Ok(p) => p,
-        Err(err) => {
-            app.message = format!("distill failed: {err:#}");
-            return Ok(());
-        }
-    };
-    if prep.messages == 0 {
-        app.message = "no codex history found to distill".to_string();
-        return Ok(());
+fn start_distillation(app: &mut App) {
+    if app.distill.is_some() {
+        return; // one prep at a time
     }
+    // prepare() reads the codex + Claude archives (several seconds), so run it on
+    // a worker thread and poll it from the manager loop — the UI stays live.
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(distill::prepare());
+    });
+    app.distill = Some(DistillJob {
+        rx,
+        started: Instant::now(),
+    });
+    app.message = "Preparing distillation \u{2026} reading your codex + Claude history".to_string();
+}
 
-    // codex runs in the corpus dir and only reads/writes there. `-a never -s
-    // workspace-write` keeps it autonomous inside that dir; pre-trusting the dir
-    // in codex's config (below) stops its first-run "trust this folder?" gate
-    // from stalling an unattended run. Best-effort — if the trust write fails the
-    // session still works, it just waits once for the user to approve.
+// Called each manager tick: if the background prep is done, launch the codex
+// session; otherwise refresh the elapsed-time status. Returns true if the status
+// changed and the screen should repaint.
+fn poll_distillation(app: &mut App) -> Result<bool> {
+    let Some(job) = &app.distill else {
+        return Ok(false);
+    };
+    match job.rx.try_recv() {
+        Err(mpsc::TryRecvError::Empty) => {
+            // Still scanning — animate an elapsed-seconds status so it never looks hung.
+            let secs = job.started.elapsed().as_secs();
+            app.message = format!(
+                "Preparing distillation \u{2026} {secs}s (reading your codex + Claude history)"
+            );
+            Ok(true)
+        }
+        Err(mpsc::TryRecvError::Disconnected) => {
+            app.distill = None;
+            app.message = "distill failed: preparer thread stopped".to_string();
+            Ok(true)
+        }
+        Ok(result) => {
+            app.distill = None;
+            match result {
+                Ok(prep) => finish_distillation(app, prep),
+                Err(err) => {
+                    app.message = format!("distill failed: {err:#}");
+                    Ok(true)
+                }
+            }
+        }
+    }
+}
+
+// Launch the autonomous codex session for a ready corpus. codex runs in the
+// corpus dir and only reads/writes there; `-a never -s workspace-write` keeps it
+// autonomous, and pre-trusting the dir in codex's config stops its first-run
+// "trust this folder?" gate from stalling the unattended run (best-effort). The
+// session is tagged with its distill version (drives its list label + "Done"
+// status) and is NOT auto-attached — it shows up like any session; attach to watch.
+fn finish_distillation(app: &mut App, prep: distill::DistillPrep) -> Result<bool> {
+    if prep.messages == 0 {
+        app.message = "no history found to distill".to_string();
+        return Ok(true);
+    }
     let _ = distill::ensure_trusted(&prep.workdir);
     let workdir = prep.workdir.to_string_lossy().to_string();
     let codex_args = vec![
         "-C".to_string(),
-        workdir.clone(),
+        workdir,
         "-s".to_string(),
         "workspace-write".to_string(),
         "-a".to_string(),
         "never".to_string(),
     ];
-    let title = format!("distill: response style v{:03}", prep.version);
+    let title = format!("[distill v{}]", prep.version);
     let prompt = distill::distill_prompt(&prep);
 
-    match create_session_in(&title, Some(prompt), Some(prep.workdir.clone()), codex_args) {
+    match create_session_in(
+        &title,
+        Some(prompt),
+        Some(prep.workdir.clone()),
+        codex_args,
+        Some(prep.version),
+    ) {
         Ok(session) => {
             app.reload()?;
             if let Some(pos) = app.sessions.iter().position(|s| s.id == session.id) {
                 app.selected = pos;
             }
             app.message = format!(
-                "distilling your style \u{2192} {} ({} sessions, {} chunks) \u{00b7} Enter to watch",
-                prep.output_file, prep.sessions, prep.chunks.len()
+                "distilling your style + logic \u{2192} {} ({} sessions: {} codex + {} claude, {} chunks) \u{00b7} Enter to watch",
+                prep.output_file,
+                prep.sessions,
+                prep.codex_sessions,
+                prep.claude_sessions,
+                prep.chunks.len()
             );
         }
         Err(err) => {
             app.message = format!("distill launch failed: {err:#}");
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 // Full form: `cwd_override` pins the session's working directory (else the
@@ -1185,6 +1288,7 @@ fn create_session_in(
     initial_prompt: Option<String>,
     cwd_override: Option<PathBuf>,
     codex_args: Vec<String>,
+    distill_version: Option<u32>,
 ) -> Result<SessionState> {
     state::ensure_base_dirs()?;
     let id = state::new_session_id();
@@ -1215,6 +1319,7 @@ fn create_session_in(
         title_pinned: false,
         last_output_at: 0,
         codex_args,
+        distill_version,
     };
     state::write_state(&session)?;
     // Seed the manager-owned label so the title is authoritative from birth and
@@ -1491,14 +1596,19 @@ fn draw_sessions(frame: &mut [String], app: &mut App, cols: u16, rows: u16) {
     // each. Emit sections in a fixed order but SKIP any that are empty — an
     // empty "Working  0 / none" block is just clutter, so a section appears only
     // when it actually has sessions.
-    let mut by_bucket: [Vec<usize>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    let mut by_bucket: [Vec<usize>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
     for (i, s) in app.sessions.iter().enumerate() {
         by_bucket[bucket_slot(bucket_of(&app.activity, s))].push(i);
     }
     let mut items: Vec<DisplayItem> = Vec::new();
-    for (slot, b) in [Bucket::NeedsInput, Bucket::Working, Bucket::Stopped]
-        .into_iter()
-        .enumerate()
+    for (slot, b) in [
+        Bucket::NeedsInput,
+        Bucket::Working,
+        Bucket::Done,
+        Bucket::Stopped,
+    ]
+    .into_iter()
+    .enumerate()
     {
         if by_bucket[slot].is_empty() {
             continue;
@@ -1605,9 +1715,29 @@ fn session_row_line(
         age.insert(0, ' '); // right-align in a fixed 4-wide column
     }
 
-    let title_s = fit_cols(&session.title, title_w);
+    // A distill session carries a distinct "[distill vN]" tag instead of codex's
+    // first prompt line, so it's obvious at a glance what it is.
+    let label = match session.distill_version {
+        Some(v) => format!("[distill v{v}]"),
+        None => session.title.clone(),
+    };
+    let title_s = fit_cols(&label, title_w);
     let title_color = if selected { C_SELTITLE } else { C_TITLE };
     let msg_w = cw.saturating_sub(title_w + 12);
+    // Distillation runs for several minutes; while it works, lead the preview with
+    // elapsed time + a rough ETA so the long run never reads as stuck.
+    let preview_owned;
+    let preview: &str = if session.distill_version.is_some() && matches!(bucket, Bucket::Working) {
+        let el = state::now_secs().saturating_sub(session.created_at);
+        preview_owned = format!(
+            "distilling your style + logic \u{2026} {} elapsed \u{00b7} ~15 min typical \u{00b7} {}",
+            format_age(el),
+            preview
+        );
+        &preview_owned
+    } else {
+        preview
+    };
     let preview_s = fit_cols(preview, msg_w);
 
     styled_line(|b| {

@@ -14,7 +14,7 @@ Cockpit class is also importable for ad-hoc driving:
 
     c = Cockpit(RAIL); c.boot(); c.new("hello"); c.png("after_new.png"); c.quit()
 """
-import fcntl, glob, json, os, pty, select, shutil, signal, struct, subprocess, sys, termios, threading, time
+import fcntl, glob, json, os, pty, re, select, shutil, signal, struct, subprocess, sys, termios, threading, time
 import pyte
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -665,6 +665,67 @@ def audit(rail, pngdir=None):
               made and shown and args_ok and trust_ok,
               f"chunks={len(chunks)} shown={shown} args_ok={args_ok} trust_ok={trust_ok}")
         snap(c, "15_distill")
+    finally:
+        c.close()
+
+    # 16) detach-hint occlusion fix: the Ctrl+Z hint draws in its OWN alternate
+    #     screen and never clears codex's real (primary) screen. A primary clear,
+    #     against the worker's tail-only replay, is what wiped a reattached codex
+    #     (its recent output is partial updates, not a whole frame) from attach 2 on.
+    c = Cockpit(rail, codex=FAKE_SLEEP).boot()
+    try:
+        c.seed_running_worker("occ-0", "OCCTEST", codex=FAKE_SLEEP)
+        c.wait_until(lambda: c.row_with("OCCTEST") is not None, timeout=8)
+        m = c.mark()
+        c.key(b"\r", 1.0)                         # Enter -> attach -> show_detach_hint
+        raw = c.raw_since(m)
+        in_alt, primary_clears, bracketed = 1, 0, False   # rail boots inside its own alt
+        for mo in re.finditer(rb"\x1b\[\?1049h|\x1b\[\?1049l|\x1b\[2J|\x1b\[3J", raw):
+            t = mo.group()
+            if t.endswith(b"1049h"):
+                in_alt += 1
+            elif t.endswith(b"1049l"):
+                in_alt -= 1
+            elif in_alt <= 0:
+                primary_clears += 1              # a clear on codex's real screen = the bug
+            else:
+                bracketed = True                 # a clear safely inside the hint's own buffer
+        check("detach hint: drawn in own alt screen, never clears codex's real screen",
+              primary_clears == 0 and bracketed,
+              f"primary_screen_clears={primary_clears} used_own_alt={bracketed}")
+        snap(c, "16_occlusion")
+    finally:
+        c.close()
+
+    # 17) distill session UX: a distinct "[distill vN]" label (not codex's prompt
+    #     line); a finished distill (style file present) reads as "Done", not
+    #     "Needs input"; a running one shows an elapsed/ETA hint so it never looks stuck.
+    c = Cockpit(rail).boot()
+    try:
+        ddir = os.path.join(c.home, ".config", "codex-rail", "distill")
+        os.makedirs(ddir, exist_ok=True)
+        # a DONE distillation: idle session whose style file is already on disk
+        c.seed("dist-done", "[distill v7]", distill_version=7)
+        open(os.path.join(ddir, "style-v007.md"), "w").write("# style\n")
+        # a WORKING distillation: a running session whose rollout shows an
+        # in-progress turn (task_started, no task_complete) -> Active -> Working.
+        roll = os.path.join(c.home, ".codex", "sessions", "2026", "07", "06",
+                            "rollout-2026-07-06T10-00-00-distwork.jsonl")
+        os.makedirs(os.path.dirname(roll), exist_ok=True)
+        with open(roll, "w") as f:
+            f.write(json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}) + "\n")
+        c.seed("dist-work", "[distill v3]", status="running", distill_version=3,
+               codex_rollout_path=roll, codex_session_id="cs-distwork")
+        c.wait_until(lambda: c.row_with("distill v3") is not None, timeout=8)
+        time.sleep(1.0)                           # let the manager reload + scan the rollout
+        txt = c.text()
+        label_ok = "[distill v7]" in txt and "[distill v3]" in txt
+        done_ok = "Done" in txt and "✓" in txt
+        hint_ok = "distilling" in txt and "~15 min" in txt
+        check("distill UX: [distill vN] label + Done status + running time hint",
+              label_ok and done_ok and hint_ok,
+              f"label={label_ok} done={done_ok} hint={hint_ok}")
+        snap(c, "17_distill_ux")
     finally:
         c.close()
 
