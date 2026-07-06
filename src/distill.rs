@@ -27,8 +27,13 @@ const MSG_CAP_DEFAULT: usize = 700; // chars kept per USER turn
 const LEAD_CAP_DEFAULT: usize = 220; // chars kept per assistant lead-in (context)
 const CHUNK_BYTES_DEFAULT: usize = 200_000; // per corpus chunk
 const BUDGET_BYTES_DEFAULT: usize = 4_000_000; // total corpus size target
-const SCAN_FILES_DEFAULT: usize = 320; // most-recent files scanned per source
-const SCAN_BYTES_DEFAULT: usize = 300 * 1024 * 1024; // cap total bytes read per source
+// Scan the WHOLE archive by default so the richness ranking sees every session,
+// not just recent ones — the corpus is still the richest slice that fits the
+// budget, but it's drawn from everything. Both caps are env-overridable so a
+// slow box (or a test) can bound the scan; HUGE_FILE_BYTES still skips a single
+// pathological transcript.
+const SCAN_FILES_DEFAULT: usize = 100_000; // effectively "all files" per source
+const SCAN_BYTES_DEFAULT: usize = 6 * 1024 * 1024 * 1024; // 6 GiB read cap per source
 const HUGE_FILE_BYTES: u64 = 30 * 1024 * 1024; // skip a pathologically large transcript
 const TURN_CAP: usize = 64; // max turns kept per session (head + tail if longer)
 // A line this long is only ever a giant tool_call/tool_result blob — a human turn
@@ -52,6 +57,9 @@ fn budget_bytes() -> usize {
 }
 fn scan_files() -> usize {
     env_usize("CODEX_RAIL_DISTILL_SCAN_FILES", SCAN_FILES_DEFAULT).max(1)
+}
+fn scan_bytes() -> usize {
+    env_usize("CODEX_RAIL_DISTILL_SCAN_BYTES", SCAN_BYTES_DEFAULT).max(1024 * 1024)
 }
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
@@ -151,27 +159,52 @@ pub fn prepare() -> Result<DistillPrep> {
             .then_with(|| b.date.cmp(&a.date))
     });
 
-    // Greedily format the richest sessions until the byte budget is filled.
+    // Fill the corpus balanced across sources BY BYTES: take richest-first within
+    // each source, always extending whichever source has contributed fewer bytes
+    // so far. Claude has ~25x more sessions than codex, so a single global ranking
+    // would let it crowd codex out entirely; balancing keeps both tools well
+    // represented (and spills to the other source once one is exhausted).
     let budget = budget_bytes();
+    let codex: Vec<&Convo> = convos.iter().filter(|c| c.src == Src::Codex).collect();
+    let claude: Vec<&Convo> = convos.iter().filter(|c| c.src == Src::Claude).collect();
+    let (mut ci, mut li) = (0usize, 0usize);
+    let (mut cx_bytes, mut cl_bytes) = (0usize, 0usize);
     let mut body_blocks: Vec<String> = Vec::new();
-    let mut total = 0usize;
-    let mut included = 0usize;
     let mut user_msgs = 0usize;
     let (mut inc_codex, mut inc_claude) = (0usize, 0usize);
-    for c in &convos {
-        if total >= budget {
+    loop {
+        if cx_bytes + cl_bytes >= budget {
             break;
         }
-        let block = format_convo(c, included + 1, cap, lead);
-        total += block.len();
-        user_msgs += c.user_turns();
-        match c.src {
-            Src::Codex => inc_codex += 1,
-            Src::Claude => inc_claude += 1,
+        // Prefer the source with fewer bytes so far; fall back when one is spent.
+        let take_codex = match (ci < codex.len(), li < claude.len()) {
+            (true, true) => cx_bytes <= cl_bytes,
+            (true, false) => true,
+            (false, true) => false,
+            (false, false) => break,
+        };
+        let idx = body_blocks.len() + 1;
+        let c = if take_codex {
+            let c = codex[ci];
+            ci += 1;
+            inc_codex += 1;
+            c
+        } else {
+            let c = claude[li];
+            li += 1;
+            inc_claude += 1;
+            c
+        };
+        let block = format_convo(c, idx, cap, lead);
+        if take_codex {
+            cx_bytes += block.len();
+        } else {
+            cl_bytes += block.len();
         }
-        included += 1;
+        user_msgs += c.user_turns();
         body_blocks.push(block);
     }
+    let included = body_blocks.len();
 
     // Pack blocks into chunk-sized buffers. A session may span a chunk boundary —
     // fine, codex reads every chunk in order.
@@ -246,8 +279,9 @@ fn scan_codex(cap: usize, out: &mut Vec<Convo>) -> usize {
 
     let mut scanned = 0;
     let mut bytes = 0usize;
+    let byte_cap = scan_bytes();
     for path in files {
-        if bytes >= SCAN_BYTES_DEFAULT {
+        if bytes >= byte_cap {
             break;
         }
         if fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > HUGE_FILE_BYTES {
@@ -359,8 +393,9 @@ fn scan_claude(cap: usize, out: &mut Vec<Convo>) -> usize {
 
     let mut scanned = 0;
     let mut bytes = 0usize;
+    let byte_cap = scan_bytes();
     for path in files {
-        if bytes >= SCAN_BYTES_DEFAULT {
+        if bytes >= byte_cap {
             break;
         }
         if fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > HUGE_FILE_BYTES {
