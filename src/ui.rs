@@ -482,6 +482,14 @@ fn manager_loop(terminal: &mut TerminalSession, app: &mut App) -> Result<()> {
                 render(app)?;
             }
         }
+        // A finished `/update` reports its result on the status line.
+        if let Some(rx) = &app.update_apply {
+            if let Ok(msg) = rx.try_recv() {
+                app.message = msg;
+                app.update_apply = None;
+                render(app)?;
+            }
+        }
 
         if !event::poll(Duration::from_millis(80))? {
             continue;
@@ -527,6 +535,9 @@ struct App {
     // Set when the user tried to attach a maybe-live imported session; a second
     // Enter within the window confirms the resume (which starts a 2nd codex).
     resume_confirm: Option<(String, Instant)>,
+    // Highlighted row in the composer's slash-command palette (when the input
+    // starts with '/').
+    slash_sel: usize,
     rows: Vec<(u16, usize)>,
     // Memoized rollout recovery per session id: Some(path) once resolved, None
     // once we've scanned and found no confident match. Keeps the (potentially
@@ -559,6 +570,8 @@ struct App {
     // GitHub-unreachable just leaves it None.
     update_rx: Option<mpsc::Receiver<Option<String>>>,
     update_available: Option<String>,
+    // In-flight `/update` apply; its result message lands on the status line.
+    update_apply: Option<mpsc::Receiver<String>>,
 }
 
 // A background codex-session scan in flight. The startup scan reads every
@@ -593,6 +606,7 @@ impl App {
             stop_confirm: None,
             exit_confirm: None,
             resume_confirm: None,
+            slash_sel: 0,
             rows: Vec::new(),
             rollout_cache: HashMap::new(),
             activity: HashMap::new(),
@@ -606,6 +620,7 @@ impl App {
             adopt_since: UNIX_EPOCH,
             update_rx: None,
             update_available: None,
+            update_apply: None,
         };
         app.sessions = state::load_sessions()?;
         resolve_missing_rollouts(&mut app.sessions, &mut app.rollout_cache);
@@ -951,12 +966,146 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, terminal: &mut TerminalSessio
     Ok(false)
 }
 
+// Composer slash commands (Claude-Code-style): typing `/` in the composer opens a
+// palette of rail actions, run rail-side instead of being sent to codex.
+#[derive(Clone, Copy)]
+enum SlashCmd {
+    Distill,
+    Update,
+    Config,
+    Help,
+    Quit,
+}
+struct Slash {
+    name: &'static str,
+    desc: &'static str,
+    cmd: SlashCmd,
+}
+const SLASH_COMMANDS: &[Slash] = &[
+    Slash {
+        name: "/distill",
+        desc: "distill your style + logic from codex/Claude history",
+        cmd: SlashCmd::Distill,
+    },
+    Slash {
+        name: "/update",
+        desc: "check for and install a newer rail",
+        cmd: SlashCmd::Update,
+    },
+    Slash {
+        name: "/config",
+        desc: "show config & data locations",
+        cmd: SlashCmd::Config,
+    },
+    Slash {
+        name: "/help",
+        desc: "show keys & commands",
+        cmd: SlashCmd::Help,
+    },
+    Slash {
+        name: "/quit",
+        desc: "quit rail (sessions keep running)",
+        cmd: SlashCmd::Quit,
+    },
+];
+
+// Commands whose name starts with the current input (which begins with '/').
+fn slash_matches(input: &str) -> Vec<&'static Slash> {
+    let q = input.trim();
+    SLASH_COMMANDS
+        .iter()
+        .filter(|c| c.name.starts_with(q))
+        .collect()
+}
+
+// Run the selected slash command (Enter in the composer while input starts with
+// '/'). Returns true to quit the manager.
+fn run_slash(app: &mut App) -> Result<bool> {
+    let matches = slash_matches(&app.input);
+    let picked = matches
+        .get(app.slash_sel)
+        .or_else(|| matches.first())
+        .map(|c| c.cmd);
+    let raw = app.input.clone();
+    app.mode = Mode::Normal;
+    app.input.clear();
+    app.slash_sel = 0;
+    let Some(cmd) = picked else {
+        app.message = format!("unknown command: {}", raw.trim());
+        return Ok(false);
+    };
+    match cmd {
+        SlashCmd::Distill => start_distillation(app),
+        SlashCmd::Update => start_update(app),
+        SlashCmd::Config => {
+            app.message = format!(
+                "data {} · distill {} · codex {}",
+                state::data_dir().display(),
+                state::distill_dir().display(),
+                state::codex_home_dir().display()
+            );
+        }
+        SlashCmd::Help => {
+            app.message =
+                "↑↓ move · Enter attach · e new · / commands · Ctrl+X twice stop · Esc twice quit"
+                    .to_string();
+        }
+        SlashCmd::Quit => return Ok(true),
+    }
+    Ok(false)
+}
+
+// Kick off `rail update` in the background (a curl check + download); the result
+// lands on the status line. Never blocks the UI.
+fn start_update(app: &mut App) {
+    app.message = "checking for updates \u{2026}".to_string();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let msg = match update::newer_available() {
+            Some(_) => match update::apply() {
+                Ok(tag) => format!("updated to {tag} — restart rail to run it"),
+                Err(e) => format!("update failed: {e:#}"),
+            },
+            None => "already up to date (or GitHub unreachable)".to_string(),
+        };
+        let _ = tx.send(msg);
+    });
+    app.update_apply = Some(rx);
+}
+
 fn handle_input_key(
     key: KeyEvent,
     app: &mut App,
     terminal: &mut TerminalSession,
     mode: Mode,
 ) -> Result<bool> {
+    // While composing a NEW session, a leading '/' turns the box into a command
+    // palette: navigate with ↑↓, run with Enter, complete with Tab.
+    let slashing = mode == Mode::New && app.input.starts_with('/');
+    if slashing {
+        match key.code {
+            KeyCode::Up => {
+                app.slash_sel = app.slash_sel.saturating_sub(1);
+                return Ok(false);
+            }
+            KeyCode::Down => {
+                let n = slash_matches(&app.input).len();
+                if n > 0 {
+                    app.slash_sel = (app.slash_sel + 1).min(n - 1);
+                }
+                return Ok(false);
+            }
+            KeyCode::Tab => {
+                let matches = slash_matches(&app.input);
+                if let Some(c) = matches.get(app.slash_sel).or_else(|| matches.first()) {
+                    app.input = c.name.to_string();
+                }
+                return Ok(false);
+            }
+            KeyCode::Enter => return run_slash(app),
+            _ => {}
+        }
+    }
     match key.code {
         KeyCode::Esc => {
             app.mode = Mode::Normal;
@@ -967,16 +1116,20 @@ fn handle_input_key(
         }
         KeyCode::Backspace => {
             app.input.pop();
+            app.slash_sel = 0;
         }
         KeyCode::Enter => {
             submit_input(app, terminal, mode)?;
         }
-        KeyCode::Char('d') if key.modifiers == KeyModifiers::CONTROL => {
+        // Ctrl+D is a submit alias for a real message, but not while a slash
+        // command is being composed (that's handled above).
+        KeyCode::Char('d') if key.modifiers == KeyModifiers::CONTROL && !slashing => {
             submit_input(app, terminal, mode)?;
         }
         KeyCode::Char(ch) if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => {
             if !ch.is_control() {
                 app.input.push(ch);
+                app.slash_sel = 0;
             }
         }
         _ => {}
@@ -2157,11 +2310,48 @@ fn draw_input(frame: &mut [String], app: &App, cols: u16, rows: u16) {
     }
     let inner = box_w - 2; // usable columns between the two side borders
 
+    // Slash-command palette: while composing a new session, a leading '/' turns
+    // the box into a command menu — matching commands pop up just above it (like
+    // Claude Code), and the highlighted one runs on Enter. It overlays the bottom
+    // of the list (a transient overlay; the list redraws when the palette closes).
+    if matches!(app.mode, Mode::New) && app.input.starts_with('/') {
+        let ms = slash_matches(&app.input);
+        let sel = app.slash_sel.min(ms.len().saturating_sub(1));
+        for (i, c) in ms.iter().enumerate() {
+            let y = box_top.saturating_sub((ms.len() - i) as u16);
+            if y < 3 {
+                continue;
+            }
+            let selected = i == sel;
+            put(
+                frame,
+                y,
+                styled_line(|b| {
+                    if selected {
+                        let _ = queue!(b, SetForegroundColor(C_ACCENT), Print("  \u{258c} "));
+                    } else {
+                        let _ = queue!(b, Print("    "));
+                    }
+                    let _ = queue!(
+                        b,
+                        SetForegroundColor(if selected { C_SELTITLE } else { C_TITLE }),
+                        Print(format!("{:<9}", c.name)),
+                        Print("  "),
+                        SetForegroundColor(C_DIM),
+                        Print(fit_cols(c.desc, inner.saturating_sub(14)))
+                    );
+                }),
+            );
+        }
+    }
+
     // Top border. In compose/rename mode it carries a small mode label as a box
     // title ("╭─ new session ─╮"); otherwise a plain faint border. Transient
     // status and confirm messages live on the bottom hint line now, not here —
     // a quit/stop prompt has no business appearing inside the text box.
+    let slashing = matches!(app.mode, Mode::New) && app.input.starts_with('/');
     let label = match app.mode {
+        Mode::New if slashing => Some("command"),
         Mode::New => Some("new session"),
         Mode::Rename => Some("rename"),
         Mode::Normal => None,
@@ -2188,7 +2378,7 @@ fn draw_input(frame: &mut [String], app: &App, cols: u16, rows: u16) {
     // typing it's the entered name. The mode (new/rename) shows on the border.
     let (body_text, body_color) = match app.mode {
         Mode::Normal => (
-            "press e, or just start typing, to send codex a first message".to_string(),
+            "press e or type to message codex \u{00b7} type / for commands".to_string(),
             C_DIM,
         ),
         Mode::New | Mode::Rename => (app.input.clone(), C_TITLE),
@@ -2264,9 +2454,9 @@ fn draw_hint(frame: &mut [String], app: &App, cols: u16, rows: u16) {
     } else {
         let hint = match app.mode {
             Mode::Normal => {
-                "↑↓ move · Enter attach · e new · Ctrl+R rename · Ctrl+X twice stop · Ctrl+D distill · Esc twice quit"
+                "↑↓ move · Enter attach · e new · / commands · Ctrl+R rename · Ctrl+X twice stop · Esc twice quit"
             }
-            Mode::New => "Enter start · Esc cancel · empty = blank session",
+            Mode::New => "Enter start · Esc cancel · / for commands · empty = blank session",
             Mode::Rename => "Enter save · Esc cancel",
         };
         (hint.to_string(), C_DIM)

@@ -829,6 +829,24 @@ def audit(rail, pngdir=None):
     finally:
         c.close()
 
+    # 21) slash-command palette: typing '/' in the composer opens a command menu
+    #     that filters as you type and runs the command rail-side (not sent to codex).
+    c = Cockpit(rail).boot()
+    try:
+        c.seed_codex_history(n_sessions=1, msgs_each=2)  # so /distill has input
+        c.key(b"/", 0.4)                                  # open the palette
+        palette = all(cmd in c.text() for cmd in ("/distill", "/update", "/config", "/help"))
+        c.key(b"di", 0.3)                                 # filter -> only /distill
+        filtered = "/distill" in c.text() and "/update" not in c.text()
+        c.key(b"\r", 2.5)                                 # Enter -> run /distill (like Ctrl+D)
+        corpus = os.path.join(c.home, ".config", "codex-rail", "distill", "corpus")
+        ran = os.path.isdir(corpus) and len(glob.glob(corpus + "/corpus-*.md")) >= 1
+        check("slash palette: / opens + filters commands and runs one (/distill)",
+              palette and filtered and ran, f"palette={palette} filtered={filtered} ran={ran}")
+        snap(c, "21_slash")
+    finally:
+        c.close()
+
     # ---- summary
     npass = sum(1 for _, ok, _ in results if ok)
     print(f"\n==== {npass}/{len(results)} checks PASS ====")
