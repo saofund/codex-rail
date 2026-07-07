@@ -61,6 +61,12 @@ pub struct SessionState {
     // lands. None for ordinary sessions.
     #[serde(default)]
     pub distill_version: Option<u32>,
+    // True for an IMPORTED codex session — one discovered in ~/.codex/sessions for
+    // the manager's cwd but not started by rail. In-memory only (never serialized):
+    // the row is a resumable snapshot until the user attaches, at which point it's
+    // resumed (codex resume) and persisted like any other session.
+    #[serde(skip)]
+    pub adopted: bool,
 }
 
 pub fn now_secs() -> u64 {

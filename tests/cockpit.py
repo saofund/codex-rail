@@ -77,6 +77,8 @@ class Cockpit:
                     "CODEX_RAIL_CODEX": self.codex, "TERM": "xterm-256color",
                     # 4s detach-hint progress bar -> fast in tests; raise it to watch it fill
                     "CODEX_RAIL_HINT_MS": os.environ.get("COCKPIT_HINT_MS", "60"),
+                    # rescan ~/.codex for cwd-matching sessions fast so tests don't wait 20s
+                    "CODEX_RAIL_ADOPT_MS": "300",
                     "COLUMNS": str(COLS), "LINES": str(ROWS)})
         self.m, s = pty.openpty()
         fcntl.ioctl(s, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
@@ -726,6 +728,45 @@ def audit(rail, pngdir=None):
               label_ok and done_ok and hint_ok,
               f"label={label_ok} done={done_ok} hint={hint_ok}")
         snap(c, "17_distill_ux")
+    finally:
+        c.close()
+
+    # 18) adopt: a codex session whose session_meta.cwd matches the manager's cwd
+    #     is imported into the list as a resumable row, even though rail never
+    #     created it — so rail manages the project's whole codex history.
+    c = Cockpit(rail).boot()  # rail inherits this process's cwd
+    try:
+        cwd = os.getcwd()
+        sid = "019f0000-ad07-7000-8000-00000000abcd"
+        d = os.path.join(c.home, ".codex", "sessions", "2026", "07", "07")
+        os.makedirs(d, exist_ok=True)
+        roll = os.path.join(d, f"rollout-2026-07-07T00-00-00-{sid}.jsonl")
+        with open(roll, "w") as f:
+            f.write(json.dumps({"type": "session_meta",
+                                "payload": {"id": sid, "cwd": cwd,
+                                            "timestamp": "2026-07-07T00:00:00"}}) + "\n")
+            f.write(json.dumps({"type": "event_msg",
+                                "payload": {"type": "user_message",
+                                            "message": "ADOPTMARKER hello there"}}) + "\n")
+        with open(os.path.join(c.home, ".codex", "history.jsonl"), "a") as f:
+            f.write(json.dumps({"session_id": sid, "ts": 0, "text": "ADOPTMARKER hello there"}) + "\n")
+        # startup already scanned (empty); wait for the throttled rescan (300ms) to import it
+        c.wait_until(lambda: c.row_with("ADOPTMARKER") is not None, timeout=8)
+        imported = c.row_with("ADOPTMARKER") is not None
+        # a non-matching-cwd session must NOT be imported
+        sid2 = "019f0000-ad08-7000-8000-00000000ef01"
+        roll2 = os.path.join(d, f"rollout-2026-07-07T00-00-01-{sid2}.jsonl")
+        with open(roll2, "w") as f:
+            f.write(json.dumps({"type": "session_meta",
+                                "payload": {"id": sid2, "cwd": "/tmp/some-other-dir",
+                                            "timestamp": "2026-07-07T00:00:01"}}) + "\n")
+            f.write(json.dumps({"type": "event_msg",
+                                "payload": {"type": "user_message", "message": "OTHERCWD nope"}}) + "\n")
+        time.sleep(1.0)
+        other_absent = c.row_with("OTHERCWD") is None
+        check("adopt: cwd-matching codex session imported (non-matching excluded)",
+              imported and other_absent, f"imported={imported} other_absent={other_absent}")
+        snap(c, "18_adopt")
     finally:
         c.close()
 

@@ -30,6 +30,18 @@ use std::time::{Duration, Instant};
 const STOP_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
 const EXIT_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
 const REFRESH_INTERVAL: Duration = Duration::from_millis(700);
+// How often to re-scan ~/.codex/sessions for newly-created sessions in this cwd.
+// The scan reads a header line per rollout, so it's throttled well above the
+// 700ms UI refresh; new codex sessions still appear within this window.
+// Overridable via CODEX_RAIL_ADOPT_MS (tests set it low).
+fn adopt_interval() -> Duration {
+    Duration::from_millis(
+        env::var("CODEX_RAIL_ADOPT_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20_000),
+    )
+}
 // Preview tail: enough to contain the last agent_message even when codex writes
 // large events (a single message line can be tens of KB).
 const ROLLOUT_TAIL_BYTES: u64 = 256 * 1024;
@@ -498,6 +510,11 @@ struct App {
     // polls this each tick, shows an elapsed-time status, and launches the codex
     // session once the corpus is ready — the UI never freezes.
     distill: Option<DistillJob>,
+    // Codex sessions for the manager's cwd that rail didn't start (see
+    // adopt_codex_sessions), rescanned on a throttle and merged into the list on
+    // every reload so the manager also drives the project's existing history.
+    adopted: Vec<SessionState>,
+    last_adopt: Option<Instant>,
 }
 
 // A background `distill::prepare()` in flight: the channel it will deliver on,
@@ -524,9 +541,13 @@ impl App {
             preview: HashMap::new(),
             prev_frame: Vec::new(),
             distill: None,
+            adopted: Vec::new(),
+            last_adopt: None,
         };
         app.sessions = state::load_sessions()?;
         resolve_missing_rollouts(&mut app.sessions, &mut app.rollout_cache);
+        app.rescan_adopted();
+        app.merge_adopted();
         app.refresh_derived();
         app.sort_for_display();
         Ok(app)
@@ -537,6 +558,16 @@ impl App {
         self.sessions = state::load_sessions()?;
         resolve_missing_rollouts(&mut self.sessions, &mut self.rollout_cache);
         sync_titles_from_history(&mut self.sessions);
+        // Re-import the cwd's codex sessions (throttled — the scan reads a header
+        // line per rollout), then merge the cached set into the list every reload.
+        if self
+            .last_adopt
+            .map(|t| t.elapsed() >= adopt_interval())
+            .unwrap_or(true)
+        {
+            self.rescan_adopted();
+        }
+        self.merge_adopted();
         self.refresh_derived();
         self.sort_for_display();
         if let Some(id) = selected_id {
@@ -589,6 +620,50 @@ impl App {
         self.lifecycle.retain(|k, _| ids.contains(k));
         self.preview.retain(|k, _| ids.contains(k));
         self.rollout_cache.retain(|k, _| ids.contains(k));
+    }
+
+    // Re-import the cwd's codex sessions into `self.adopted`, excluding any codex
+    // session already backed by a real rail session. Excludes by BOTH codex id and
+    // rollout path: an old rail session may have never captured its codex id (so
+    // it can't match by id), but resolve_missing_rollouts recovers its rollout
+    // path, which does match the adopted candidate's — so it isn't duplicated.
+    fn rescan_adopted(&mut self) {
+        let cwd = env::current_dir().unwrap_or_default();
+        let mut exclude: HashSet<String> = HashSet::new();
+        for s in &self.sessions {
+            if let Some(id) = &s.codex_session_id {
+                exclude.insert(id.clone());
+            }
+            if let Some(p) = &s.codex_rollout_path {
+                exclude.insert(p.clone());
+            }
+        }
+        self.adopted = adopt_codex_sessions(&cwd, &exclude);
+        self.last_adopt = Some(Instant::now());
+    }
+
+    // Append the imported sessions that aren't already in the list (by id, codex
+    // id, or rollout path). An adopted row drops out here once it's been attached
+    // (which persists it under its codex id), so it's never shown twice.
+    fn merge_adopted(&mut self) {
+        let mut have: HashSet<String> = HashSet::new();
+        for s in &self.sessions {
+            have.insert(s.id.clone());
+            if let Some(c) = &s.codex_session_id {
+                have.insert(c.clone());
+            }
+            if let Some(p) = &s.codex_rollout_path {
+                have.insert(p.clone());
+            }
+        }
+        for a in &self.adopted {
+            let dup = have.contains(&a.id)
+                || a.codex_session_id.as_ref().is_some_and(|c| have.contains(c))
+                || a.codex_rollout_path.as_ref().is_some_and(|p| have.contains(p));
+            if !dup {
+                self.sessions.push(a.clone());
+            }
+        }
     }
 
     // Order sessions by bucket (Needs input, then Working, then Stopped),
@@ -1143,6 +1218,68 @@ fn sync_titles_from_history(sessions: &mut [SessionState]) {
     }
 }
 
+// Discover the user's EXISTING codex sessions whose cwd matches the manager's
+// launch dir and import them as resumable (exited) rows — so rail manages the
+// whole project's codex history, not only sessions it started. Cheap: reads each
+// rollout's one-line session_meta header. Skips any codex session already backed
+// by a real rail session (`exclude`). Titles come from codex's own history; the
+// rows are in-memory until attached, when they resume + persist like any exited
+// session (attach -> relaunch_worker -> codex resume <id>).
+fn adopt_codex_sessions(cwd: &Path, exclude: &HashSet<String>) -> Vec<SessionState> {
+    let target = std::fs::canonicalize(cwd).ok();
+    if target.is_none() {
+        return Vec::new();
+    }
+    let codex = env::var("CODEX_RAIL_CODEX").unwrap_or_else(|_| "codex".to_string());
+    let firsts = state::codex_first_messages();
+    let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for path in state::list_rollout_files() {
+        let Some((rcwd, sid)) = state::rollout_head(&path) else {
+            continue;
+        };
+        let path_str = path.to_string_lossy().to_string();
+        if exclude.contains(&sid) || exclude.contains(&path_str) || !seen.insert(sid.clone()) {
+            continue;
+        }
+        // Compare resolved (symlink-free) paths so a trailing slash or a symlinked
+        // project dir still lines up; a session whose cwd is gone is skipped.
+        match std::fs::canonicalize(&rcwd).ok() {
+            Some(r) if Some(&r) == target.as_ref() => {}
+            _ => continue,
+        }
+        let created = state::session_id_start_secs(&sid).unwrap_or(0);
+        let title = firsts
+            .get(&sid)
+            .map(|m| title_from_message(m))
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| format!("codex {}", sid.chars().take(8).collect::<String>()));
+        out.push(SessionState {
+            id: sid.clone(),
+            title,
+            cwd: cwd.to_string_lossy().to_string(),
+            codex: codex.clone(),
+            status: STATUS_EXITED.to_string(),
+            worker_pid: None,
+            child_pid: None,
+            socket: state::socket_path(&sid).to_string_lossy().to_string(),
+            created_at: created,
+            updated_at: created,
+            exit_code: None,
+            last_error: None,
+            codex_session_id: Some(sid.clone()),
+            codex_rollout_path: Some(path.to_string_lossy().to_string()),
+            initial_prompt: None,
+            title_pinned: false,
+            last_output_at: 0,
+            codex_args: Vec::new(),
+            distill_version: None,
+            adopted: true,
+        });
+    }
+    out
+}
+
 // First non-empty line of a message, length-capped, for use as a list title.
 fn title_from_message(msg: &str) -> String {
     msg.lines()
@@ -1320,6 +1457,7 @@ fn create_session_in(
         last_output_at: 0,
         codex_args,
         distill_version,
+        adopted: false,
     };
     state::write_state(&session)?;
     // Seed the manager-owned label so the title is authoritative from birth and
@@ -1722,7 +1860,15 @@ fn session_row_line(
         None => session.title.clone(),
     };
     let title_s = fit_cols(&label, title_w);
-    let title_color = if selected { C_SELTITLE } else { C_TITLE };
+    // Imported codex-history rows (adopted, not started by rail) render dimmer so
+    // they read as "resumable history" next to the sessions rail owns.
+    let title_color = if selected {
+        C_SELTITLE
+    } else if session.adopted {
+        C_DIM
+    } else {
+        C_TITLE
+    };
     let msg_w = cw.saturating_sub(title_w + 12);
     // Distillation runs for several minutes; while it works, lead the preview with
     // elapsed time + a rough ETA so the long run never reads as stuck.
