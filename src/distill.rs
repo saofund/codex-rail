@@ -27,14 +27,19 @@ const MSG_CAP_DEFAULT: usize = 700; // chars kept per USER turn
 const LEAD_CAP_DEFAULT: usize = 220; // chars kept per assistant lead-in (context)
 const CHUNK_BYTES_DEFAULT: usize = 200_000; // per corpus chunk
 const BUDGET_BYTES_DEFAULT: usize = 4_000_000; // total corpus size target
-// Scan the WHOLE archive by default so the richness ranking sees every session,
-// not just recent ones — the corpus is still the richest slice that fits the
-// budget, but it's drawn from everything. Both caps are env-overridable so a
-// slow box (or a test) can bound the scan; HUGE_FILE_BYTES still skips a single
-// pathological transcript.
-const SCAN_FILES_DEFAULT: usize = 100_000; // effectively "all files" per source
-const SCAN_BYTES_DEFAULT: usize = 6 * 1024 * 1024 * 1024; // 6 GiB read cap per source
-const HUGE_FILE_BYTES: u64 = 30 * 1024 * 1024; // skip a pathologically large transcript
+// Tiered sampling: rather than read the whole multi-GB archive, we stat every
+// file (cheap) and then READ only a bounded candidate set — the BIGGEST files
+// (most content = a richness proxy) plus the NEWEST (current working style),
+// capped at SCAN_FILES per source. The richness ranking then refines within
+// those candidates. This keeps the scan lean and bounded no matter how large the
+// archive grows. All caps are env-overridable; HUGE_FILE_BYTES skips a single
+// pathological transcript before reading it.
+const SCAN_FILES_DEFAULT: usize = 1000; // max candidate files READ per source
+const SCAN_BYTES_DEFAULT: usize = 500 * 1024 * 1024; // read cap per source (newest read first)
+// Skip a single transcript bigger than this before reading it: past ~12 MB a
+// session is almost all tool output, not user turns, so it's expensive to read
+// and turn-poor — skipping it lets many more turn-dense sessions fit the budget.
+const HUGE_FILE_BYTES: u64 = 12 * 1024 * 1024;
 const TURN_CAP: usize = 64; // max turns kept per session (head + tail if longer)
 // A line this long is only ever a giant tool_call/tool_result blob — a human turn
 // or an assistant lead-in never approaches it. Skipping such lines (see
@@ -256,8 +261,9 @@ pub fn prepare() -> Result<DistillPrep> {
     })
 }
 
-// Scan both sources (most-recent files first) into contextualized conversations.
-// Returns the convos with >=1 real user turn and how many files were read.
+// Scan both sources (a biggest+newest candidate sample per source) into
+// contextualized conversations. Returns the convos with >=1 real user turn and
+// how many files were actually read.
 fn scan_all() -> (Vec<Convo>, usize) {
     let cap = scan_files();
     let mut convos = Vec::new();
@@ -268,6 +274,46 @@ fn scan_all() -> (Vec<Convo>, usize) {
     (convos, scanned)
 }
 
+// From the full file list, pick up to `cap` candidates to actually READ: the
+// NEWEST (~1/4 of the cap) plus the BIGGEST (the rest). Stat-only, so it never
+// reads a file it won't use — the cheap tier that bounds a huge archive to a
+// representative sample before the (expensive) parse. Dedups the overlap.
+fn pick_candidates(files: Vec<PathBuf>, cap: usize) -> Vec<PathBuf> {
+    if files.len() <= cap {
+        return files;
+    }
+    let metas: Vec<(PathBuf, u64, std::time::SystemTime)> = files
+        .into_iter()
+        .map(|p| {
+            let (sz, mt) = fs::metadata(&p)
+                .map(|m| (m.len(), m.modified().unwrap_or(std::time::UNIX_EPOCH)))
+                .unwrap_or((0, std::time::UNIX_EPOCH));
+            (p, sz, mt)
+        })
+        .collect();
+    let newest_n = cap / 4;
+    let mut seen = std::collections::HashSet::new();
+    let mut chosen: Vec<PathBuf> = Vec::with_capacity(cap);
+    let mut by_time: Vec<&(PathBuf, u64, std::time::SystemTime)> = metas.iter().collect();
+    by_time.sort_by_key(|(_, _, m)| Reverse(*m));
+    for (p, _, _) in by_time.into_iter().take(newest_n) {
+        if seen.insert(p.clone()) {
+            chosen.push(p.clone());
+        }
+    }
+    let mut by_size: Vec<&(PathBuf, u64, std::time::SystemTime)> = metas.iter().collect();
+    by_size.sort_by_key(|(_, s, _)| Reverse(*s));
+    for (p, _, _) in by_size {
+        if chosen.len() >= cap {
+            break;
+        }
+        if seen.insert(p.clone()) {
+            chosen.push(p.clone());
+        }
+    }
+    chosen
+}
+
 // codex rollouts: user_message (user), agent_message (assistant lead-in),
 // function_call (tool names attached to the surrounding assistant turn).
 fn scan_codex(cap: usize, out: &mut Vec<Convo>) -> usize {
@@ -275,10 +321,7 @@ fn scan_codex(cap: usize, out: &mut Vec<Convo>) -> usize {
     walk_files(&state::codex_sessions_dir(), 0, &mut files, &|n| {
         n.starts_with("rollout-") && n.ends_with(".jsonl")
     });
-    // rollout-<ISO timestamp> filenames sort chronologically; newest first.
-    files.sort();
-    files.reverse();
-    files.truncate(cap);
+    let files = pick_candidates(files, cap); // biggest + newest, capped
 
     let mut scanned = 0;
     let mut bytes = 0usize;
@@ -390,9 +433,7 @@ fn scan_claude(cap: usize, out: &mut Vec<Convo>) -> usize {
     walk_files(&state::claude_projects_dir(), 0, &mut files, &|n| {
         n.ends_with(".jsonl")
     });
-    // Newest first by mtime (Claude filenames are random UUIDs, not sortable).
-    files.sort_by_key(|p| Reverse(fs::metadata(p).and_then(|m| m.modified()).ok()));
-    files.truncate(cap);
+    let files = pick_candidates(files, cap); // biggest + newest, capped
 
     let mut scanned = 0;
     let mut bytes = 0usize;
