@@ -25,7 +25,11 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some("--version") | Some("-V") => {
-            println!("rail {}", env!("CARGO_PKG_VERSION"));
+            println!(
+                "rail {} ({})",
+                env!("CARGO_PKG_VERSION"),
+                env!("RAIL_GIT_SHA")
+            );
             Ok(())
         }
         // Diagnostic/headless: aggregate the archive corpus without launching a
