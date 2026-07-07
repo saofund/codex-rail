@@ -346,6 +346,34 @@ pub fn remove_session(id: &str) -> Result<()> {
     Ok(())
 }
 
+fn adopt_dismiss_path() -> PathBuf {
+    data_dir().join(".adopt_dismissed")
+}
+
+// Codex session ids the user has "removed" from an imported (adopted) row. They
+// have no on-disk footprint to delete, so we record the id here and skip it on
+// the next rescan — the codex transcript itself is never touched.
+pub fn adopt_dismissed() -> std::collections::HashSet<String> {
+    fs::read_to_string(adopt_dismiss_path())
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+pub fn dismiss_adopted(id: &str) -> Result<()> {
+    ensure_base_dirs()?;
+    let mut cur = adopt_dismissed();
+    if cur.insert(id.to_string()) {
+        let mut body: Vec<String> = cur.into_iter().collect();
+        body.sort();
+        fs::write(adopt_dismiss_path(), body.join("\n") + "\n")
+            .context("write adopt dismiss list")?;
+    }
+    Ok(())
+}
+
 fn home_dir() -> PathBuf {
     env::var_os("HOME")
         .map(PathBuf::from)
@@ -437,6 +465,33 @@ pub fn rollout_head(path: &Path) -> Option<(String, String)> {
         .and_then(|s| s.as_str())?
         .to_string();
     Some((cwd, sid))
+}
+
+// The first genuine user message in a rollout, to title an imported session when
+// codex's history.jsonl doesn't have it (an old session, or history was cleared).
+// Reads only the top of the file (the first turn is near the start). Best-effort.
+pub fn rollout_first_user_message(path: &Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    for line in reader.lines().take(300).map_while(Result::ok) {
+        if !line.contains("user_message") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if v.get("type").and_then(|t| t.as_str()) != Some("event_msg") {
+            continue;
+        }
+        let p = v.get("payload");
+        if p.and_then(|p| p.get("type")).and_then(|t| t.as_str()) != Some("user_message") {
+            continue;
+        }
+        if let Some(msg) = p.and_then(|p| p.get("message")).and_then(|m| m.as_str()) {
+            return Some(msg.to_string());
+        }
+    }
+    None
 }
 
 // Every rollout JSONL under codex's sessions tree.

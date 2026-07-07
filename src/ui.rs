@@ -23,9 +23,10 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const STOP_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
 const EXIT_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
@@ -71,10 +72,11 @@ const C_WORKING: Color = Color::Rgb { r: 122, g: 208, b: 142 }; // green
 const C_DONE: Color = Color::Rgb { r: 100, g: 200, b: 210 }; // teal: finished task
 const C_STOPPED: Color = Color::Rgb { r: 140, g: 148, b: 168 }; // grey (readable, not "black")
 
-// Cap the content region so age/metadata sit in a tidy column instead of
-// flying to the far right edge of a wide terminal (that left a dead gap in
-// the middle of every row). Everything past this is intentional margin.
-const MAX_CONTENT_COLS: usize = 78;
+// Cap the content region so age/metadata don't fly to the far edge of an
+// ultra-wide terminal. The message-preview column fills the middle, so a wider
+// cap just shows more of each codex message (no dead gap) — 120 uses a normal
+// wide terminal fully while still reining in a 200-column one.
+const MAX_CONTENT_COLS: usize = 120;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Activity {
@@ -450,6 +452,27 @@ fn manager_loop(terminal: &mut TerminalSession, app: &mut App) -> Result<()> {
             render(app)?;
         }
 
+        // Drive the background codex-session scan: show its real progress while it
+        // runs (only when it's actually running AND nothing else is on the status
+        // line — never clobber a confirm/warning), merge the imported rows in when
+        // it finishes. The manager already rendered, so this never blocks startup.
+        if app.adopt_job.is_some() {
+            if app.poll_adopt() {
+                app.merge_adopted();
+                app.refresh_derived();
+                app.sort_for_display();
+                if app.message.starts_with("importing codex history") {
+                    app.message.clear();
+                }
+                render(app)?;
+            } else if app.message.is_empty() || app.message.starts_with("importing codex history") {
+                if let Some(status) = app.adopt_status() {
+                    app.message = status;
+                    render(app)?;
+                }
+            }
+        }
+
         if !event::poll(Duration::from_millis(80))? {
             continue;
         }
@@ -491,6 +514,9 @@ struct App {
     message: String,
     stop_confirm: Option<(String, Instant)>,
     exit_confirm: Option<Instant>,
+    // Set when the user tried to attach a maybe-live imported session; a second
+    // Enter within the window confirms the resume (which starts a 2nd codex).
+    resume_confirm: Option<(String, Instant)>,
     rows: Vec<(u16, usize)>,
     // Memoized rollout recovery per session id: Some(path) once resolved, None
     // once we've scanned and found no confident match. Keeps the (potentially
@@ -511,10 +537,27 @@ struct App {
     // session once the corpus is ready — the UI never freezes.
     distill: Option<DistillJob>,
     // Codex sessions for the manager's cwd that rail didn't start (see
-    // adopt_codex_sessions), rescanned on a throttle and merged into the list on
-    // every reload so the manager also drives the project's existing history.
-    adopted: Vec<SessionState>,
-    last_adopt: Option<Instant>,
+    // adopt_codex_sessions), keyed by codex session id and accumulated across
+    // background scans; merged into the list every reload. The scan runs OFF the
+    // UI thread so the manager appears instantly and never looks frozen.
+    adopted: HashMap<String, SessionState>,
+    adopt_job: Option<AdoptJob>,
+    adopt_started: Option<Instant>, // throttles rescans
+    adopt_since: SystemTime,        // rescans read only rollouts modified after this
+}
+
+// A background codex-session scan in flight. The startup scan reads every
+// rollout; a rescan reads only files modified since the last scan (cheap).
+// Progress is shared so the UI can draw a real bar of what's being scanned.
+struct AdoptJob {
+    rx: mpsc::Receiver<Vec<SessionState>>,
+    progress: Arc<AdoptProgress>,
+    scan_start: SystemTime,
+}
+struct AdoptProgress {
+    done: AtomicUsize,
+    total: AtomicUsize,
+    current: Mutex<String>, // basename of the file being scanned
 }
 
 // A background `distill::prepare()` in flight: the channel it will deliver on,
@@ -534,6 +577,7 @@ impl App {
             message: String::new(),
             stop_confirm: None,
             exit_confirm: None,
+            resume_confirm: None,
             rows: Vec::new(),
             rollout_cache: HashMap::new(),
             activity: HashMap::new(),
@@ -541,12 +585,14 @@ impl App {
             preview: HashMap::new(),
             prev_frame: Vec::new(),
             distill: None,
-            adopted: Vec::new(),
-            last_adopt: None,
+            adopted: HashMap::new(),
+            adopt_job: None,
+            adopt_started: None,
+            adopt_since: UNIX_EPOCH,
         };
         app.sessions = state::load_sessions()?;
         resolve_missing_rollouts(&mut app.sessions, &mut app.rollout_cache);
-        app.rescan_adopted();
+        app.spawn_adopt_scan(); // off-thread; adopted rows merge in when it finishes
         app.merge_adopted();
         app.refresh_derived();
         app.sort_for_display();
@@ -558,14 +604,16 @@ impl App {
         self.sessions = state::load_sessions()?;
         resolve_missing_rollouts(&mut self.sessions, &mut self.rollout_cache);
         sync_titles_from_history(&mut self.sessions);
-        // Re-import the cwd's codex sessions (throttled — the scan reads a header
-        // line per rollout), then merge the cached set into the list every reload.
-        if self
-            .last_adopt
-            .map(|t| t.elapsed() >= adopt_interval())
-            .unwrap_or(true)
+        // Start a background rescan when idle and the throttle has elapsed (it
+        // reads only rollouts modified since the last scan), then merge whatever
+        // has already been imported.
+        if self.adopt_job.is_none()
+            && self
+                .adopt_started
+                .map(|t| t.elapsed() >= adopt_interval())
+                .unwrap_or(false)
         {
-            self.rescan_adopted();
+            self.spawn_adopt_scan();
         }
         self.merge_adopted();
         self.refresh_derived();
@@ -622,14 +670,18 @@ impl App {
         self.rollout_cache.retain(|k, _| ids.contains(k));
     }
 
-    // Re-import the cwd's codex sessions into `self.adopted`, excluding any codex
-    // session already backed by a real rail session. Excludes by BOTH codex id and
-    // rollout path: an old rail session may have never captured its codex id (so
-    // it can't match by id), but resolve_missing_rollouts recovers its rollout
-    // path, which does match the adopted candidate's — so it isn't duplicated.
-    fn rescan_adopted(&mut self) {
+    // Start a background scan of ~/.codex/sessions for this cwd. First call is a
+    // full scan (adopt_since = epoch); later calls read only rollouts modified
+    // since the previous scan (cheap). Excludes sessions already in the list or
+    // dismissed — excludes by BOTH codex id and rollout path, since an old rail
+    // session may never have captured its codex id but resolve_missing_rollouts
+    // recovers its path, which matches the candidate's (so it isn't duplicated).
+    fn spawn_adopt_scan(&mut self) {
+        if self.adopt_job.is_some() {
+            return;
+        }
         let cwd = env::current_dir().unwrap_or_default();
-        let mut exclude: HashSet<String> = HashSet::new();
+        let mut exclude: HashSet<String> = state::adopt_dismissed();
         for s in &self.sessions {
             if let Some(id) = &s.codex_session_id {
                 exclude.insert(id.clone());
@@ -638,14 +690,87 @@ impl App {
                 exclude.insert(p.clone());
             }
         }
-        self.adopted = adopt_codex_sessions(&cwd, &exclude);
-        self.last_adopt = Some(Instant::now());
+        let since = self.adopt_since;
+        let scan_start = SystemTime::now();
+        let progress = Arc::new(AdoptProgress {
+            done: AtomicUsize::new(0),
+            total: AtomicUsize::new(0),
+            current: Mutex::new(String::new()),
+        });
+        let prog = progress.clone();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(adopt_codex_sessions(&cwd, &exclude, since, &prog));
+        });
+        self.adopt_job = Some(AdoptJob {
+            rx,
+            progress,
+            scan_start,
+        });
+        self.adopt_started = Some(Instant::now());
     }
 
-    // Append the imported sessions that aren't already in the list (by id, codex
-    // id, or rollout path). An adopted row drops out here once it's been attached
-    // (which persists it under its codex id), so it's never shown twice.
+    // Poll the background scan. On completion, accumulate the found sessions into
+    // self.adopted (keyed by codex id) and advance the mtime cutoff. Returns true
+    // when it finishes so the caller repaints (the imported rows just appeared).
+    fn poll_adopt(&mut self) -> bool {
+        let Some(job) = &self.adopt_job else {
+            return false;
+        };
+        match job.rx.try_recv() {
+            Ok(found) => {
+                self.adopt_since = job.scan_start;
+                for s in found {
+                    if let Some(id) = s.codex_session_id.clone() {
+                        self.adopted.insert(id, s);
+                    }
+                }
+                self.adopt_job = None;
+                true
+            }
+            Err(mpsc::TryRecvError::Empty) => false,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.adopt_job = None;
+                true
+            }
+        }
+    }
+
+    // A live one-line progress string while a scan runs, else None: a real bar of
+    // files scanned plus the file currently being read.
+    fn adopt_status(&self) -> Option<String> {
+        let job = self.adopt_job.as_ref()?;
+        let total = job.progress.total.load(Ordering::Relaxed);
+        let done = job.progress.done.load(Ordering::Relaxed);
+        if total == 0 {
+            return Some("importing codex history \u{2026}".to_string());
+        }
+        let bar = progress::render(
+            16,
+            done as f64 / total as f64,
+            progress::Style {
+                fill: C_ACCENT,
+                track: C_FAINT,
+            },
+        );
+        let cur = job
+            .progress
+            .current
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_default();
+        Some(format!(
+            "importing codex history {bar} {done}/{total} \u{00b7} {cur}"
+        ))
+    }
+
+    // Merge the accumulated imported sessions into the list, skipping any now
+    // backed by a real rail session (by id / codex id / rollout path) or dismissed.
     fn merge_adopted(&mut self) {
+        if self.adopted.is_empty() {
+            return;
+        }
+        let dismissed = state::adopt_dismissed();
         let mut have: HashSet<String> = HashSet::new();
         for s in &self.sessions {
             have.insert(s.id.clone());
@@ -656,14 +781,17 @@ impl App {
                 have.insert(p.clone());
             }
         }
-        for a in &self.adopted {
-            let dup = have.contains(&a.id)
+        let mut adds: Vec<SessionState> = Vec::new();
+        for (sid, a) in &self.adopted {
+            let dup = dismissed.contains(sid)
+                || have.contains(&a.id)
                 || a.codex_session_id.as_ref().is_some_and(|c| have.contains(c))
                 || a.codex_rollout_path.as_ref().is_some_and(|p| have.contains(p));
             if !dup {
-                self.sessions.push(a.clone());
+                adds.push(a.clone());
             }
         }
+        self.sessions.extend(adds);
     }
 
     // Order sessions by bucket (Needs input, then Working, then Stopped),
@@ -1033,6 +1161,23 @@ fn attach_current(app: &mut App, terminal: &mut TerminalSession) -> Result<()> {
         return Ok(());
     };
 
+    // An imported session with a very recently-written rollout may be a codex
+    // running in another terminal; resuming it would put a SECOND codex on the
+    // same transcript. Confirm with a second Enter before doing that.
+    if adopted_maybe_live(&session) {
+        let confirmed = app
+            .resume_confirm
+            .as_ref()
+            .map(|(id, at)| id == &session.id && at.elapsed() <= STOP_CONFIRM_WINDOW)
+            .unwrap_or(false);
+        if !confirmed {
+            app.resume_confirm = Some((session.id.clone(), Instant::now()));
+            app.message = "this codex session looks active elsewhere — Enter again to resume anyway (starts a 2nd instance)".to_string();
+            return Ok(());
+        }
+        app.resume_confirm = None;
+    }
+
     if matches!(session.status.as_str(), STATUS_EXITED | STATUS_FAILED) {
         if let Err(err) = relaunch_worker(&session) {
             app.message = format!("resume failed: {err:#}");
@@ -1225,16 +1370,39 @@ fn sync_titles_from_history(sessions: &mut [SessionState]) {
 // by a real rail session (`exclude`). Titles come from codex's own history; the
 // rows are in-memory until attached, when they resume + persist like any exited
 // session (attach -> relaunch_worker -> codex resume <id>).
-fn adopt_codex_sessions(cwd: &Path, exclude: &HashSet<String>) -> Vec<SessionState> {
+fn adopt_codex_sessions(
+    cwd: &Path,
+    exclude: &HashSet<String>,
+    since: SystemTime,
+    progress: &AdoptProgress,
+) -> Vec<SessionState> {
     let target = std::fs::canonicalize(cwd).ok();
     if target.is_none() {
         return Vec::new();
     }
     let codex = env::var("CODEX_RAIL_CODEX").unwrap_or_else(|_| "codex".to_string());
     let firsts = state::codex_first_messages();
+    // Stat every rollout, then only READ the ones modified since the last scan
+    // (a rescan reads a handful instead of the whole archive). Cheap: stat only.
+    let mut files: Vec<(PathBuf, SystemTime)> = Vec::new();
+    for p in state::list_rollout_files() {
+        let mt = std::fs::metadata(&p)
+            .and_then(|m| m.modified())
+            .unwrap_or(UNIX_EPOCH);
+        if mt >= since {
+            files.push((p, mt));
+        }
+    }
+    progress.total.store(files.len(), Ordering::Relaxed);
     let mut out = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    for path in state::list_rollout_files() {
+    for (path, mt) in files {
+        progress.done.fetch_add(1, Ordering::Relaxed);
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if let Ok(mut c) = progress.current.lock() {
+                *c = name.to_string();
+            }
+        }
         let Some((rcwd, sid)) = state::rollout_head(&path) else {
             continue;
         };
@@ -1249,10 +1417,23 @@ fn adopt_codex_sessions(cwd: &Path, exclude: &HashSet<String>) -> Vec<SessionSta
             _ => continue,
         }
         let created = state::session_id_start_secs(&sid).unwrap_or(0);
+        // Rollout mtime doubles as the row's age and as the live-session signal:
+        // a very recently written rollout may be a codex running elsewhere.
+        let mtime_secs = mt
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         let title = firsts
             .get(&sid)
             .map(|m| title_from_message(m))
             .filter(|t| !t.is_empty())
+            .or_else(|| {
+                // history.jsonl didn't have it — fall back to the rollout's own
+                // first user message so the row still gets a meaningful title.
+                state::rollout_first_user_message(Path::new(&path_str))
+                    .map(|m| title_from_message(&m))
+                    .filter(|t| !t.is_empty())
+            })
             .unwrap_or_else(|| format!("codex {}", sid.chars().take(8).collect::<String>()));
         out.push(SessionState {
             id: sid.clone(),
@@ -1264,20 +1445,28 @@ fn adopt_codex_sessions(cwd: &Path, exclude: &HashSet<String>) -> Vec<SessionSta
             child_pid: None,
             socket: state::socket_path(&sid).to_string_lossy().to_string(),
             created_at: created,
-            updated_at: created,
+            updated_at: mtime_secs.max(created),
             exit_code: None,
             last_error: None,
             codex_session_id: Some(sid.clone()),
-            codex_rollout_path: Some(path.to_string_lossy().to_string()),
+            codex_rollout_path: Some(path_str),
             initial_prompt: None,
             title_pinned: false,
-            last_output_at: 0,
+            last_output_at: mtime_secs,
             codex_args: Vec::new(),
             distill_version: None,
             adopted: true,
         });
     }
     out
+}
+
+// An imported session whose rollout was written very recently — it may be a
+// codex running in another terminal. Resuming it would start a second writer on
+// the same transcript, so attach warns + confirms before resuming.
+const ADOPT_LIVE_WINDOW_SECS: u64 = 180;
+fn adopted_maybe_live(s: &SessionState) -> bool {
+    s.adopted && state::now_secs().saturating_sub(s.last_output_at) < ADOPT_LIVE_WINDOW_SECS
 }
 
 // First non-empty line of a message, length-capped, for use as a list title.
@@ -1546,6 +1735,16 @@ fn stop_with_confirmation(app: &mut App) -> Result<()> {
                 app.message = format!("stop failed: {err}");
             }
         }
+    } else if session.adopted {
+        // An imported codex row has no on-disk footprint to delete — "removing" it
+        // dismisses it so the rescan stops re-importing it. The codex transcript is
+        // kept; without this the row would re-appear on the next scan (the bug).
+        if let Some(sid) = &session.codex_session_id {
+            let _ = state::dismiss_adopted(sid);
+        }
+        app.message = "removed from list (codex session kept on disk)".to_string();
+        app.invalidate_frame();
+        app.reload()?;
     } else {
         match state::remove_session(&session.id) {
             Ok(()) => {
@@ -1861,9 +2060,12 @@ fn session_row_line(
     };
     let title_s = fit_cols(&label, title_w);
     // Imported codex-history rows (adopted, not started by rail) render dimmer so
-    // they read as "resumable history" next to the sessions rail owns.
+    // they read as "resumable history"; one whose rollout was just written shows
+    // amber, a hint it may be a codex running elsewhere (attaching warns first).
     let title_color = if selected {
         C_SELTITLE
+    } else if adopted_maybe_live(session) {
+        C_NEEDS
     } else if session.adopted {
         C_DIM
     } else {

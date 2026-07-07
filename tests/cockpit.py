@@ -770,6 +770,63 @@ def audit(rail, pngdir=None):
     finally:
         c.close()
 
+    # 19) remove an IMPORTED row: it has no on-disk footprint, so "remove" must
+    #     DISMISS it (record its codex id) — the bug was that it re-imported and
+    #     wouldn't go away.
+    c = Cockpit(rail).boot()
+    try:
+        cwd = os.getcwd()
+        sid = "019f0000-d15a-7000-8000-000000001234"
+        d = os.path.join(c.home, ".codex", "sessions", "2026", "07", "07")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, f"rollout-2026-07-07T00-00-05-{sid}.jsonl"), "w") as f:
+            f.write(json.dumps({"type": "session_meta",
+                                "payload": {"id": sid, "cwd": cwd, "timestamp": "2026-07-07T00:00:05"}}) + "\n")
+            f.write(json.dumps({"type": "event_msg",
+                                "payload": {"type": "user_message", "message": "DISMISSME please"}}) + "\n")
+        c.wait_until(lambda: c.row_with("DISMISSME") is not None, timeout=8)
+        for _ in range(15):
+            if "DISMISSME" in (c.selected_row() or ""):
+                break
+            c.key(b"\x1b[B", 0.2)
+        c.key(b"\x18", 0.4)   # Ctrl+X (confirm remove)
+        c.key(b"\x18", 0.6)   # Ctrl+X (remove -> dismiss)
+        gone = c.row_with("DISMISSME") is None
+        dfile = os.path.join(c.data, "codex-rail", ".adopt_dismissed")
+        dismissed = os.path.exists(dfile) and sid in open(dfile).read()
+        time.sleep(1.2)       # let a rescan cycle run
+        stays_gone = c.row_with("DISMISSME") is None
+        check("adopt: removing an imported row dismisses it (stays gone, not re-imported)",
+              gone and dismissed and stays_gone,
+              f"gone={gone} dismissed={dismissed} stays_gone={stays_gone}")
+    finally:
+        c.close()
+
+    # 20) attaching a maybe-live imported session (rollout just written) WARNS and
+    #     confirms before resuming — so it can't silently start a 2nd codex on the
+    #     same transcript.
+    c = Cockpit(rail).boot()
+    try:
+        cwd = os.getcwd()
+        sid = "019f0000-11e0-7000-8000-00000000abed"
+        d = os.path.join(c.home, ".codex", "sessions", "2026", "07", "07")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, f"rollout-2026-07-07T00-00-09-{sid}.jsonl"), "w") as f:
+            f.write(json.dumps({"type": "session_meta",
+                                "payload": {"id": sid, "cwd": cwd, "timestamp": "2026-07-07T00:00:09"}}) + "\n")
+            f.write(json.dumps({"type": "event_msg",
+                                "payload": {"type": "user_message", "message": "LIVEMARK now"}}) + "\n")
+        c.wait_until(lambda: c.row_with("LIVEMARK") is not None, timeout=8)
+        for _ in range(15):
+            if "LIVEMARK" in (c.selected_row() or ""):
+                break
+            c.key(b"\x1b[B", 0.2)
+        c.key(b"\r", 0.7)     # Enter -> should WARN (not attach), rollout is fresh = maybe live
+        warned = any("active elsewhere" in r for r in c.rows()) and c.row_with("LIVEMARK") is not None
+        check("adopt: attaching a maybe-live session warns before resuming", warned, f"warned={warned}")
+    finally:
+        c.close()
+
     # ---- summary
     npass = sum(1 for _, ok, _ in results if ok)
     print(f"\n==== {npass}/{len(results)} checks PASS ====")
