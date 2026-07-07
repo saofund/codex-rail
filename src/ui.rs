@@ -1,6 +1,7 @@
 use crate::attach;
 use crate::distill;
 use crate::progress;
+use crate::update;
 use crate::state::{
     self, SessionState, STATUS_EXITED, STATUS_FAILED, STATUS_RUNNING, STATUS_STARTING,
     STATUS_STOPPING,
@@ -473,6 +474,15 @@ fn manager_loop(terminal: &mut TerminalSession, app: &mut App) -> Result<()> {
             }
         }
 
+        // The background update check returns once; surface it as a header note.
+        if let Some(rx) = &app.update_rx {
+            if let Ok(result) = rx.try_recv() {
+                app.update_available = result;
+                app.update_rx = None;
+                render(app)?;
+            }
+        }
+
         if !event::poll(Duration::from_millis(80))? {
             continue;
         }
@@ -544,6 +554,11 @@ struct App {
     adopt_job: Option<AdoptJob>,
     adopt_started: Option<Instant>, // throttles rescans
     adopt_since: SystemTime,        // rescans read only rollouts modified after this
+    // Background "is a newer build on GitHub?" check; its result (a newer short
+    // commit, or None) surfaces as a quiet header note. Best-effort — offline or
+    // GitHub-unreachable just leaves it None.
+    update_rx: Option<mpsc::Receiver<Option<String>>>,
+    update_available: Option<String>,
 }
 
 // A background codex-session scan in flight. The startup scan reads every
@@ -589,10 +604,21 @@ impl App {
             adopt_job: None,
             adopt_started: None,
             adopt_since: UNIX_EPOCH,
+            update_rx: None,
+            update_available: None,
         };
         app.sessions = state::load_sessions()?;
         resolve_missing_rollouts(&mut app.sessions, &mut app.rollout_cache);
         app.spawn_adopt_scan(); // off-thread; adopted rows merge in when it finishes
+        // Fire the update check off the UI thread; the header shows a note if a
+        // newer build lands. Skipped when CODEX_RAIL_NO_UPDATE_CHECK is set.
+        if env::var_os("CODEX_RAIL_NO_UPDATE_CHECK").is_none() {
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let _ = tx.send(update::newer_available());
+            });
+            app.update_rx = Some(rx);
+        }
         app.merge_adopted();
         app.refresh_derived();
         app.sort_for_display();
@@ -1852,9 +1878,15 @@ fn draw_header(frame: &mut [String], cols: u16, app: &App) {
         format!("{total} sessions")
     };
 
-    // Title left, session count right, both inside the capped content width.
+    // Title left, session count right, both inside the capped content width. A
+    // pending update shows a quiet amber note just before the count.
+    let note = if app.update_available.is_some() {
+        "\u{2191} update available  "
+    } else {
+        ""
+    };
     let left_used = 2 + display_width(title);
-    let right_w = display_width(&count_s);
+    let right_w = display_width(note) + display_width(&count_s);
     let gap = cw.saturating_sub(left_used + right_w);
     put(
         frame,
@@ -1866,8 +1898,11 @@ fn draw_header(frame: &mut [String], cols: u16, app: &App) {
                 SetAttribute(Attribute::Bold),
                 Print(format!("  {title}")),
                 SetAttribute(Attribute::Reset),
+                Print(" ".repeat(gap)),
+                SetForegroundColor(C_NEEDS),
+                Print(note),
                 SetForegroundColor(C_DIM),
-                Print(format!("{}{count_s}", " ".repeat(gap)))
+                Print(&count_s)
             );
         }),
     );

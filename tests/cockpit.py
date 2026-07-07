@@ -79,6 +79,8 @@ class Cockpit:
                     "CODEX_RAIL_HINT_MS": os.environ.get("COCKPIT_HINT_MS", "60"),
                     # rescan ~/.codex for cwd-matching sessions fast so tests don't wait 20s
                     "CODEX_RAIL_ADOPT_MS": "300",
+                    # don't hit GitHub for an update check during tests
+                    "CODEX_RAIL_NO_UPDATE_CHECK": "1",
                     "COLUMNS": str(COLS), "LINES": str(ROWS)})
         self.m, s = pty.openpty()
         fcntl.ioctl(s, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))

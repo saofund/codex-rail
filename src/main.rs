@@ -6,6 +6,7 @@ mod progress;
 mod protocol;
 mod state;
 mod ui;
+mod update;
 mod worker;
 
 use anyhow::{bail, Result};
@@ -30,6 +31,22 @@ fn main() -> Result<()> {
                 env!("CARGO_PKG_VERSION"),
                 env!("RAIL_GIT_SHA")
             );
+            Ok(())
+        }
+        Some("update") => {
+            println!("rail {} ({})", env!("CARGO_PKG_VERSION"), update::build_sha());
+            match update::newer_available() {
+                Some(latest) => {
+                    println!("newer version available: {latest} — downloading…");
+                    match update::apply() {
+                        Ok(tag) => {
+                            println!("updated to {tag}. Restart rail to run the new version.")
+                        }
+                        Err(e) => println!("update failed: {e:#}"),
+                    }
+                }
+                None => println!("already up to date (or offline / GitHub unreachable)."),
+            }
             Ok(())
         }
         // Diagnostic/headless: aggregate the archive corpus without launching a
