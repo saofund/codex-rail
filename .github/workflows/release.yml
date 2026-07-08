@@ -1,0 +1,87 @@
+name: release
+
+# Rolling "latest" release: every push to main rebuilds the binaries for each
+# platform and republishes them, so `rail update` always fetches the tip of main.
+# (Public repo → unlimited Actions minutes.)
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build ${{ matrix.asset }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Static musl Linux binaries run on ANY x86_64 / aarch64 Linux (any
+          # distro, any glibc) — the portable choice.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            asset: rail-x86_64-linux
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            asset: rail-aarch64-linux
+          # macOS: Apple Silicon (arm64 runner) + Intel (x86_64 runner).
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset: rail-aarch64-macos
+          - os: macos-13
+            target: x86_64-apple-darwin
+            asset: rail-x86_64-macos
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install rust target
+        run: rustup update stable && rustup target add ${{ matrix.target }}
+      - name: Install musl cross tools (Linux)
+        if: endsWith(matrix.target, 'linux-musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
+            sudo apt-get install -y gcc-aarch64-linux-gnu
+            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+            echo "CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+          fi
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Stage asset
+        run: cp "target/${{ matrix.target }}/release/rail" "${{ matrix.asset }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+
+  publish:
+    name: publish latest release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: List artifacts
+        run: ls -la dist
+      - name: Publish rolling 'latest' release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: latest
+          make_latest: true
+          files: dist/*
+          body: |
+            Rolling build of the latest `main`. `rail update` fetches the binary
+            for your platform (rail-<arch>-<os>).
