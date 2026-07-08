@@ -854,12 +854,17 @@ def audit(rail, pngdir=None):
         for i in range(6):
             c.seed(f"ms{i}", f"mouse-sess-{i}", status="exited")
         c.wait_until(lambda: c.row_with("mouse-sess-0") is not None, timeout=6)
+        # Compare the selected SESSION, not the whole row (which contains a ticking
+        # age column that would otherwise look like a change).
+        def sel():
+            m = re.search(r"mouse-sess-\d", c.selected_row() or "")
+            return m.group(0) if m else None
         c.key(b"\x1b[B", 0.2); c.key(b"\x1b[B", 0.2)   # Down twice
-        before = c.selected_row()
+        before = sel()
         c.key(b"\x1b[<35;20;5M", 0.3)                  # SGR mouse MOVE over a different row
-        move_ok = c.selected_row() == before           # selection unchanged
+        move_ok = sel() == before                       # selected session unchanged
         c.key(b"\x1b[<65;20;10M", 0.3)                 # SGR wheel scroll-down
-        scroll_ok = c.selected_row() != before          # selection moved
+        scroll_ok = sel() != before                     # selection moved to a different session
         check("mouse: move doesn't hijack selection; wheel scrolls it",
               move_ok and scroll_ok,
               f"move_ok={move_ok} scroll_ok={scroll_ok} before={before!r}")

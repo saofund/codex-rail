@@ -164,12 +164,29 @@ Prompts are English-only for now.
 
 ## Install
 
+Download the prebuilt binary for your platform from the [latest
+release](https://github.com/saofund/codex-rail/releases/latest) — `rail-x86_64-linux`
+/ `rail-aarch64-linux` (static, any distro) or `rail-aarch64-macos` (Apple
+Silicon) — then:
+
+```sh
+install -m755 rail-x86_64-linux ~/.local/bin/rail
+```
+
+Or build from source:
+
 ```sh
 cargo build --release
 install -m755 target/release/rail ~/.local/bin/rail
 ```
 
-Set `CODEX_RAIL_CODEX=/path/to/codex` if `codex` is not on `PATH`.
+## Update
+
+`rail --version` shows the build. Run **`rail update`** (or **`/update`** in the
+manager) to fetch the latest release binary for your platform and replace itself
+in place; the manager also shows a quiet **"↑ update available"** in the header
+when a newer build is out. Set `CODEX_RAIL_CODEX=/path/to/codex` if `codex` is not
+on `PATH`.
 
 ## Data layout
 
