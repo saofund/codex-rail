@@ -31,13 +31,12 @@ jobs:
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             asset: rail-aarch64-linux
-          # macOS: Apple Silicon (arm64 runner) + Intel (x86_64 runner).
+          # macOS: Apple Silicon covers every Mac since 2020. (Intel /
+          # x86_64-apple-darwin on macos-13 is omitted — those runners are scarce
+          # and queue for ages; add it back if an Intel-Mac user needs it.)
           - os: macos-latest
             target: aarch64-apple-darwin
             asset: rail-aarch64-macos
-          - os: macos-13
-            target: x86_64-apple-darwin
-            asset: rail-x86_64-macos
     steps:
       - uses: actions/checkout@v4
       - name: Install rust target
