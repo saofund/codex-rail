@@ -847,6 +847,47 @@ def audit(rail, pngdir=None):
     finally:
         c.close()
 
+    # 22) mouse: moving the pointer must NOT change the selection (the hover-select
+    #     bug jerked a scrolled list back to the top), and the wheel scrolls it.
+    c = Cockpit(rail).boot()
+    try:
+        for i in range(6):
+            c.seed(f"ms{i}", f"mouse-sess-{i}", status="exited")
+        c.wait_until(lambda: c.row_with("mouse-sess-0") is not None, timeout=6)
+        c.key(b"\x1b[B", 0.2); c.key(b"\x1b[B", 0.2)   # Down twice
+        before = c.selected_row()
+        c.key(b"\x1b[<35;20;5M", 0.3)                  # SGR mouse MOVE over a different row
+        move_ok = c.selected_row() == before           # selection unchanged
+        c.key(b"\x1b[<65;20;10M", 0.3)                 # SGR wheel scroll-down
+        scroll_ok = c.selected_row() != before          # selection moved
+        check("mouse: move doesn't hijack selection; wheel scrolls it",
+              move_ok and scroll_ok,
+              f"move_ok={move_ok} scroll_ok={scroll_ok} before={before!r}")
+    finally:
+        c.close()
+
+    # 23) preview skips codex's synthetic "<EXTERNAL SESSION IMPORTED>" marker and
+    #     shows the last REAL agent message instead.
+    c = Cockpit(rail).boot()
+    try:
+        roll = os.path.join(c.home, ".codex", "sessions", "2026", "07", "08",
+                            "rollout-2026-07-08T00-00-00-mk.jsonl")
+        os.makedirs(os.path.dirname(roll), exist_ok=True)
+        with open(roll, "w") as f:
+            f.write(json.dumps({"type": "session_meta", "payload": {"id": "mk", "cwd": "/tmp"}}) + "\n")
+            f.write(json.dumps({"type": "event_msg",
+                                "payload": {"type": "agent_message", "message": "REALPREVIEW the actual answer"}}) + "\n")
+            f.write(json.dumps({"type": "event_msg",
+                                "payload": {"type": "agent_message", "message": "<EXTERNAL SESSION IMPORTED>"}}) + "\n")
+        c.seed("mk", "marker-sess", status="exited", codex_rollout_path=roll, codex_session_id="mk")
+        c.wait_until(lambda: c.row_with("marker-sess") is not None, timeout=6)
+        time.sleep(0.8)
+        row = c.row_with("marker-sess") or ""
+        check("preview: skips <EXTERNAL SESSION IMPORTED>, shows the real message",
+              "REALPREVIEW" in row and "SESSION IMPORTED" not in row, f"row={row!r}")
+    finally:
+        c.close()
+
     # ---- summary
     npass = sum(1 for _, ok, _ in results if ok)
     print(f"\n==== {npass}/{len(results)} checks PASS ====")

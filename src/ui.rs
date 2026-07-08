@@ -185,6 +185,9 @@ fn last_agent_message(path: &str) -> Option<String> {
             continue;
         }
         if let Some(msg) = payload.get("message").and_then(|m| m.as_str()) {
+            if is_synthetic_marker(msg) {
+                continue; // e.g. codex's "<EXTERNAL SESSION IMPORTED>" — keep looking
+            }
             let preview = preview_line(msg);
             if !preview.is_empty() {
                 return Some(preview);
@@ -192,6 +195,16 @@ fn last_agent_message(path: &str) -> Option<String> {
         }
     }
     None
+}
+
+// codex writes bracketed all-caps agent messages like "<EXTERNAL SESSION
+// IMPORTED>" when it imports/resumes a session. They aren't real content, so a
+// row's preview should skip past them to the last genuine message.
+fn is_synthetic_marker(s: &str) -> bool {
+    match s.trim().strip_prefix('<').and_then(|x| x.strip_suffix('>')) {
+        Some(inner) => !inner.is_empty() && !inner.chars().any(|c| c.is_lowercase()),
+        None => false,
+    }
 }
 
 // Collapse a message to a single tidy preview line: first non-empty line with
@@ -1210,18 +1223,20 @@ fn handle_mouse(
         .find_map(|(known_row, index)| (*known_row == row).then_some(*index));
 
     match kind {
-        MouseEventKind::Moved => {
-            if let Some(index) = row_index {
-                app.selected = index;
-                app.clear_transient();
-            }
-        }
+        // A LEFT CLICK on a row selects and attaches it.
         MouseEventKind::Down(MouseButton::Left) => {
             if let Some(index) = row_index {
                 app.selected = index;
                 attach_current(app, terminal)?;
             }
         }
+        // The wheel moves the selection (the view follows it), like ↑↓. Without
+        // this the wheel did nothing.
+        MouseEventKind::ScrollUp => app.move_prev(),
+        MouseEventKind::ScrollDown => app.move_next(),
+        // Deliberately ignore Moved: hover-to-select made any mouse twitch jerk
+        // the selection to whatever row was under the pointer — which, on a
+        // scrolled list, snapped it back to the top.
         _ => {}
     }
     Ok(false)
