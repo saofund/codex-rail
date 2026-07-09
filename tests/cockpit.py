@@ -882,16 +882,41 @@ def audit(rail, pngdir=None):
             f.write(json.dumps({"type": "session_meta", "payload": {"id": "mk", "cwd": "/tmp"}}) + "\n")
             f.write(json.dumps({"type": "event_msg",
                                 "payload": {"type": "agent_message", "message": "REALPREVIEW the actual answer"}}) + "\n")
+            # last two are codex <> system tags — both must be skipped
+            f.write(json.dumps({"type": "event_msg",
+                                "payload": {"type": "agent_message", "message": "<command-name>compact</command-name>"}}) + "\n")
             f.write(json.dumps({"type": "event_msg",
                                 "payload": {"type": "agent_message", "message": "<EXTERNAL SESSION IMPORTED>"}}) + "\n")
         c.seed("mk", "marker-sess", status="exited", codex_rollout_path=roll, codex_session_id="mk")
         c.wait_until(lambda: c.row_with("marker-sess") is not None, timeout=6)
         time.sleep(0.8)
         row = c.row_with("marker-sess") or ""
-        check("preview: skips <EXTERNAL SESSION IMPORTED>, shows the real message",
-              "REALPREVIEW" in row and "SESSION IMPORTED" not in row, f"row={row!r}")
+        check("preview: skips codex <> system tags (<EXTERNAL…>, <command-name>), shows real message",
+              "REALPREVIEW" in row and "SESSION IMPORTED" not in row and "command-name" not in row,
+              f"row={row!r}")
     finally:
         c.close()
+
+    # 24) the header "↑ update available" note is clickable — a left-click on it
+    #     runs the update (forced on via CODEX_RAIL_FAKE_UPDATE so no GitHub call).
+    os.environ["CODEX_RAIL_FAKE_UPDATE"] = "abc1234"
+    try:
+        c = Cockpit(rail).boot()
+        try:
+            c.wait_until(lambda: any("update available" in r for r in c.rows()), timeout=6)
+            note = any("update available" in r for r in c.rows())
+            hdr = next((r for r in c.rows() if "update available" in r), "")
+            col0 = hdr.index("update available")               # 0-indexed col of the note text
+            c.key(("\x1b[<0;%d;1M" % (col0 + 1)).encode(), 0.2)  # SGR left-press on the note (row 1)
+            c.key(("\x1b[<0;%d;1m" % (col0 + 1)).encode(), 0.7)  # release
+            after = c.text()
+            fired = any(k in after for k in ("checking for updates", "up to date", "update failed", "updated to"))
+            check("update notice: clicking the header note triggers the update", note and fired,
+                  f"note={note} fired={fired}")
+        finally:
+            c.close()
+    finally:
+        os.environ.pop("CODEX_RAIL_FAKE_UPDATE", None)
 
     # ---- summary
     npass = sum(1 for _, ok, _ in results if ok)

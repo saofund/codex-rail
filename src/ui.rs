@@ -197,14 +197,31 @@ fn last_agent_message(path: &str) -> Option<String> {
     None
 }
 
-// codex writes bracketed all-caps agent messages like "<EXTERNAL SESSION
-// IMPORTED>" when it imports/resumes a session. They aren't real content, so a
-// row's preview should skip past them to the last genuine message.
+// codex/system messages that aren't real assistant prose, so a row's preview
+// skips past them to the last genuine message: a whole bracketed all-caps marker
+// ("<EXTERNAL SESSION IMPORTED>"), or a message starting with a system `<tag>`
+// (slash-command echoes, injected task/command/bash/reminder blocks).
 fn is_synthetic_marker(s: &str) -> bool {
-    match s.trim().strip_prefix('<').and_then(|x| x.strip_suffix('>')) {
-        Some(inner) => !inner.is_empty() && !inner.chars().any(|c| c.is_lowercase()),
-        None => false,
+    let t = s.trim();
+    if let Some(inner) = t.strip_prefix('<').and_then(|x| x.strip_suffix('>')) {
+        if !inner.is_empty() && !inner.chars().any(|c| c.is_lowercase()) {
+            return true;
+        }
     }
+    const TAGS: [&str; 11] = [
+        "<command-name",
+        "<command-message",
+        "<command-args",
+        "<local-command",
+        "<task-notification",
+        "<bash-input",
+        "<bash-stdout",
+        "<system-reminder",
+        "<environment_context",
+        "<subagent_notification",
+        "<user_instructions",
+    ];
+    TAGS.iter().any(|tag| t.starts_with(tag))
 }
 
 // Collapse a message to a single tidy preview line: first non-empty line with
@@ -516,7 +533,7 @@ fn manager_loop(terminal: &mut TerminalSession, app: &mut App) -> Result<()> {
                 render(app)?;
             }
             Event::Mouse(mouse) => {
-                if handle_mouse(mouse.kind, mouse.row, app, terminal)? {
+                if handle_mouse(mouse.kind, mouse.row, mouse.column, app, terminal)? {
                     return Ok(());
                 }
                 render(app)?;
@@ -585,6 +602,9 @@ struct App {
     update_available: Option<String>,
     // In-flight `/update` apply; its result message lands on the status line.
     update_apply: Option<mpsc::Receiver<String>>,
+    // Column span of the header "↑ update available" note (row 0), so a click on
+    // it triggers the update. Set each render; None when no update is pending.
+    update_click: Option<(u16, u16)>,
 }
 
 // A background codex-session scan in flight. The startup scan reads every
@@ -634,16 +654,21 @@ impl App {
             update_rx: None,
             update_available: None,
             update_apply: None,
+            update_click: None,
         };
         app.sessions = state::load_sessions()?;
         resolve_missing_rollouts(&mut app.sessions, &mut app.rollout_cache);
         app.spawn_adopt_scan(); // off-thread; adopted rows merge in when it finishes
         // Fire the update check off the UI thread; the header shows a note if a
-        // newer build lands. Skipped when CODEX_RAIL_NO_UPDATE_CHECK is set.
-        if env::var_os("CODEX_RAIL_NO_UPDATE_CHECK").is_none() {
+        // newer build lands. Skipped when CODEX_RAIL_NO_UPDATE_CHECK is set;
+        // CODEX_RAIL_FAKE_UPDATE forces the note (tests, without hitting GitHub).
+        let forced = env::var("CODEX_RAIL_FAKE_UPDATE")
+            .ok()
+            .filter(|s| !s.is_empty());
+        if forced.is_some() || env::var_os("CODEX_RAIL_NO_UPDATE_CHECK").is_none() {
             let (tx, rx) = mpsc::channel();
             thread::spawn(move || {
-                let _ = tx.send(update::newer_available());
+                let _ = tx.send(forced.or_else(update::newer_available));
             });
             app.update_rx = Some(rx);
         }
@@ -1214,6 +1239,7 @@ fn submit_input(app: &mut App, terminal: &mut TerminalSession, mode: Mode) -> Re
 fn handle_mouse(
     kind: MouseEventKind,
     row: u16,
+    col: u16,
     app: &mut App,
     terminal: &mut TerminalSession,
 ) -> Result<bool> {
@@ -1223,8 +1249,17 @@ fn handle_mouse(
         .find_map(|(known_row, index)| (*known_row == row).then_some(*index));
 
     match kind {
-        // A LEFT CLICK on a row selects and attaches it.
+        // A LEFT CLICK on the header's "↑ update available" note runs the update;
+        // on a row it selects + attaches.
         MouseEventKind::Down(MouseButton::Left) => {
+            if row == 0 {
+                if let Some((a, b)) = app.update_click {
+                    if (a..b).contains(&col) {
+                        start_update(app);
+                        return Ok(false);
+                    }
+                }
+            }
             if let Some(index) = row_index {
                 app.selected = index;
                 attach_current(app, terminal)?;
@@ -2036,7 +2071,7 @@ fn render(app: &mut App) -> Result<()> {
     Ok(())
 }
 
-fn draw_header(frame: &mut [String], cols: u16, app: &App) {
+fn draw_header(frame: &mut [String], cols: u16, app: &mut App) {
     let cw = content_width(cols);
     let title = "Codex Rail";
     let total = app.sessions.len();
@@ -2056,6 +2091,13 @@ fn draw_header(frame: &mut [String], cols: u16, app: &App) {
     let left_used = 2 + display_width(title);
     let right_w = display_width(note) + display_width(&count_s);
     let gap = cw.saturating_sub(left_used + right_w);
+    // Record the note's clickable span (row 0) so a click on it runs the update.
+    app.update_click = if note.is_empty() {
+        None
+    } else {
+        let start = (left_used + gap) as u16;
+        Some((start, start + display_width(note.trim_end()) as u16))
+    };
     put(
         frame,
         0,
