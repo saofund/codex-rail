@@ -467,9 +467,44 @@ pub fn rollout_head(path: &Path) -> Option<(String, String)> {
     Some((cwd, sid))
 }
 
+// codex/system messages that aren't genuine prose, so a row's title/preview skips
+// past them to the real content: a whole bracketed all-caps marker
+// ("<EXTERNAL SESSION IMPORTED>"), a message opening with a system `<tag>` (slash
+// command echoes like <command-name>, and codex's injected
+// <environment_context>/<user_instructions>/<task-notification>/reminder blocks),
+// or codex's `[external_agent_*]` tool-bridge lines. Shared by the manager's
+// preview (last agent message) and title (first user message) derivation.
+pub fn is_synthetic_marker(s: &str) -> bool {
+    let t = s.trim();
+    // A whole `<...>` token in all-caps (no lowercase) — e.g. codex's
+    // "<EXTERNAL SESSION IMPORTED>" — is a status marker, not prose.
+    if let Some(inner) = t.strip_prefix('<').and_then(|x| x.strip_suffix('>')) {
+        if !inner.is_empty() && !inner.chars().any(|c| c.is_lowercase()) {
+            return true;
+        }
+    }
+    const TAGS: [&str; 12] = [
+        "<command-name",
+        "<command-message",
+        "<command-args",
+        "<local-command",
+        "<task-notification",
+        "<bash-input",
+        "<bash-stdout",
+        "<system-reminder",
+        "<environment_context",
+        "<subagent_notification",
+        "<user_instructions",
+        "[external_agent", // codex tool bridge: [external_agent_tool_call/result]
+    ];
+    TAGS.iter().any(|tag| t.starts_with(tag))
+}
+
 // The first genuine user message in a rollout, to title an imported session when
 // codex's history.jsonl doesn't have it (an old session, or history was cleared).
 // Reads only the top of the file (the first turn is near the start). Best-effort.
+// Skips codex's injected context turns (<environment_context>, <user_instructions>)
+// and slash-command echoes so the title is the user's real first line, not a marker.
 pub fn rollout_first_user_message(path: &Path) -> Option<String> {
     let file = fs::File::open(path).ok()?;
     let reader = std::io::BufReader::new(file);
@@ -488,6 +523,9 @@ pub fn rollout_first_user_message(path: &Path) -> Option<String> {
             continue;
         }
         if let Some(msg) = p.and_then(|p| p.get("message")).and_then(|m| m.as_str()) {
+            if is_synthetic_marker(msg) {
+                continue; // codex-injected context / slash echo — keep looking
+            }
             return Some(msg.to_string());
         }
     }
@@ -515,5 +553,34 @@ fn walk_rollouts(dir: &Path, depth: u32, out: &mut Vec<PathBuf>) {
         } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
             out.push(path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_synthetic_marker;
+
+    #[test]
+    fn synthetic_markers_are_skipped() {
+        // codex/slash/system markers → skipped in titles and previews
+        assert!(is_synthetic_marker("<EXTERNAL SESSION IMPORTED>"));
+        assert!(is_synthetic_marker("<command-name>/effort</command-name>"));
+        assert!(is_synthetic_marker("<environment_context>\ncwd: /x</environment_context>"));
+        assert!(is_synthetic_marker("<user_instructions>be nice</user_instructions>"));
+        assert!(is_synthetic_marker("<task-notification>done</task-notification>"));
+        assert!(is_synthetic_marker("  <system-reminder>hi</system-reminder>"));
+        assert!(is_synthetic_marker("[external_agent_tool_result]"));
+        assert!(is_synthetic_marker("[external_agent_tool_result: error]"));
+        assert!(is_synthetic_marker("[external_agent_tool_call: AskUserQuestion]"));
+    }
+
+    #[test]
+    fn real_prose_is_kept() {
+        // genuine user/assistant text must NOT be treated as a marker
+        assert!(!is_synthetic_marker("看下idependent idea 16_commute_wm"));
+        assert!(!is_synthetic_marker("Let's start by reading the file."));
+        assert!(!is_synthetic_marker("<html> is a lowercase tag, real prose"));
+        assert!(!is_synthetic_marker("use the [brackets] like this in a sentence"));
+        assert!(!is_synthetic_marker(""));
     }
 }

@@ -185,7 +185,7 @@ fn last_agent_message(path: &str) -> Option<String> {
             continue;
         }
         if let Some(msg) = payload.get("message").and_then(|m| m.as_str()) {
-            if is_synthetic_marker(msg) {
+            if state::is_synthetic_marker(msg) {
                 continue; // e.g. codex's "<EXTERNAL SESSION IMPORTED>" — keep looking
             }
             let preview = preview_line(msg);
@@ -195,33 +195,6 @@ fn last_agent_message(path: &str) -> Option<String> {
         }
     }
     None
-}
-
-// codex/system messages that aren't real assistant prose, so a row's preview
-// skips past them to the last genuine message: a whole bracketed all-caps marker
-// ("<EXTERNAL SESSION IMPORTED>"), or a message starting with a system `<tag>`
-// (slash-command echoes, injected task/command/bash/reminder blocks).
-fn is_synthetic_marker(s: &str) -> bool {
-    let t = s.trim();
-    if let Some(inner) = t.strip_prefix('<').and_then(|x| x.strip_suffix('>')) {
-        if !inner.is_empty() && !inner.chars().any(|c| c.is_lowercase()) {
-            return true;
-        }
-    }
-    const TAGS: [&str; 11] = [
-        "<command-name",
-        "<command-message",
-        "<command-args",
-        "<local-command",
-        "<task-notification",
-        "<bash-input",
-        "<bash-stdout",
-        "<system-reminder",
-        "<environment_context",
-        "<subagent_notification",
-        "<user_instructions",
-    ];
-    TAGS.iter().any(|tag| t.starts_with(tag))
 }
 
 // Collapse a message to a single tidy preview line: first non-empty line with
