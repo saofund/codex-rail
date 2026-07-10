@@ -321,19 +321,31 @@ fn send_log_tail(stream: &mut UnixStream, id: &str) -> Result<()> {
     if file.seek(SeekFrom::Start(start)).is_err() {
         return Ok(());
     }
-
-    let mut buf = [0_u8; 8192];
-    loop {
-        let n = match file.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(_) => break,
-        };
-        if stream.write_all(&buf[..n]).and_then(|_| stream.flush()).is_err() {
-            break;
-        }
+    let mut buf = Vec::new();
+    if file.read_to_end(&mut buf).is_err() {
+        return Ok(());
     }
+    // Snap the replay to a clean line boundary. Seeking to len-TAIL_BYTES lands on
+    // an arbitrary byte — usually mid-line, mid-escape-sequence, or mid-UTF8 char —
+    // and replaying from there garbles the first row(s) on attach. When we started
+    // mid-file, drop that partial first line.
+    let tail = clean_tail_start(&buf, start > 0);
+    let _ = stream.write_all(tail).and_then(|_| stream.flush());
     Ok(())
+}
+
+// The slice of a log tail to replay on attach: from just after the first newline
+// when the read began mid-file (so the replay starts on a clean line boundary,
+// never mid-escape / mid-UTF8), else the whole buffer. A mid-file tail with no
+// newline at all (one giant line) is replayed whole rather than dropped.
+fn clean_tail_start(buf: &[u8], started_midfile: bool) -> &[u8] {
+    if !started_midfile {
+        return buf;
+    }
+    match buf.iter().position(|&c| c == b'\n') {
+        Some(nl) => &buf[nl + 1..],
+        None => buf,
+    }
 }
 
 fn spawn_pty_reader(mut reader: Box<dyn Read + Send>, tx: Sender<WorkerEvent>) {
@@ -545,4 +557,21 @@ enum WorkerEvent {
     ClientDetach(u64),
     ClientGone(u64),
     Stop,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clean_tail_start;
+
+    #[test]
+    fn tail_replay_starts_on_a_clean_line() {
+        // mid-file: drop the partial first line (through the first '\n')
+        assert_eq!(clean_tail_start(b"tial line\x1b[m\nclean\nrest", true), b"clean\nrest");
+        // whole-file read: keep everything, including the first line
+        assert_eq!(clean_tail_start(b"first\nsecond", false), b"first\nsecond");
+        // mid-file but one giant line with no newline: replay whole, don't drop all
+        assert_eq!(clean_tail_start(b"no newline at all", true), b"no newline at all");
+        // mid-file, newline only at the very end: nothing clean to show
+        assert_eq!(clean_tail_start(b"partial\n", true), b"");
+    }
 }
