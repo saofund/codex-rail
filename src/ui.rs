@@ -1,4 +1,5 @@
 use crate::attach;
+use crate::autopilot;
 use crate::distill;
 use crate::progress;
 use crate::update;
@@ -9,8 +10,8 @@ use crate::state::{
 use anyhow::{Context, Result};
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
-    MouseButton, MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind,
 };
 use crossterm::style::{
     Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
@@ -515,9 +516,42 @@ fn manager_loop(terminal: &mut TerminalSession, app: &mut App) -> Result<()> {
                 app.invalidate_frame();
                 render(app)?;
             }
+            // A bracketed paste arrives as one event (not char-by-char), so it can't
+            // be dropped or misread as keystrokes. Newlines collapse to spaces — the
+            // composer is a single line; codex still receives it as one message.
+            Event::Paste(text) => {
+                if handle_paste(&text, app) {
+                    render(app)?;
+                }
+            }
             _ => {}
         }
     }
+}
+
+// Insert pasted text into the composer. In Normal mode a paste opens the new-
+// session composer (like typing does); while composing/renaming it appends.
+fn handle_paste(text: &str, app: &mut App) -> bool {
+    let cleaned: String = text
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    if cleaned.is_empty() {
+        return false;
+    }
+    match app.mode {
+        Mode::Normal => {
+            app.mode = Mode::New;
+            app.input.clear();
+            app.input.push_str(&cleaned);
+            app.stop_confirm = None;
+            app.exit_confirm = None;
+        }
+        Mode::New | Mode::Rename => {
+            app.input.push_str(&cleaned);
+        }
+    }
+    true
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -578,6 +612,12 @@ struct App {
     // Column span of the header "↑ update available" note (row 0), so a click on
     // it triggers the update. Set each render; None when no update is pending.
     update_click: Option<(u16, u16)>,
+    // Autopilot control per main session id (Space toggles it). Loaded from each
+    // session's autopilot.json every reload; the driver advances the reply cycle
+    // each tick. `pilot_to_main` is the reverse link (a pilot session's id -> the
+    // main it answers) so the list can render pilots grouped under their main.
+    autopilot: HashMap<String, autopilot::AutopilotState>,
+    pilot_to_main: HashMap<String, String>,
 }
 
 // A background codex-session scan in flight. The startup scan reads every
@@ -628,6 +668,8 @@ impl App {
             update_available: None,
             update_apply: None,
             update_click: None,
+            autopilot: HashMap::new(),
+            pilot_to_main: HashMap::new(),
         };
         app.sessions = state::load_sessions()?;
         resolve_missing_rollouts(&mut app.sessions, &mut app.rollout_cache);
@@ -646,9 +688,26 @@ impl App {
             app.update_rx = Some(rx);
         }
         app.merge_adopted();
+        app.load_autopilot();
         app.refresh_derived();
         app.sort_for_display();
         Ok(app)
+    }
+
+    // Load each session's autopilot.json into `autopilot` (keyed by main id) and
+    // build the reverse `pilot_to_main` link so pilots render grouped under their
+    // main. Cheap: the file exists only for autopiloted sessions.
+    fn load_autopilot(&mut self) {
+        self.autopilot.clear();
+        self.pilot_to_main.clear();
+        for s in &self.sessions {
+            if let Some(st) = autopilot::load(&s.id) {
+                if let Some(pid) = &st.pilot_id {
+                    self.pilot_to_main.insert(pid.clone(), s.id.clone());
+                }
+                self.autopilot.insert(s.id.clone(), st);
+            }
+        }
     }
 
     fn reload(&mut self) -> Result<()> {
@@ -668,6 +727,7 @@ impl App {
             self.spawn_adopt_scan();
         }
         self.merge_adopted();
+        self.load_autopilot();
         self.refresh_derived();
         self.sort_for_display();
         if let Some(id) = selected_id {
@@ -2404,15 +2464,12 @@ fn draw_input(frame: &mut [String], app: &App, cols: u16, rows: u16) {
         }),
     );
 
-    // Middle line: "│ ❯ <text> │". In Normal mode this is a dim hint; while
-    // typing it's the entered name. The mode (new/rename) shows on the border.
-    let (body_text, body_color) = match app.mode {
-        Mode::Normal => (
-            "press e or type to message codex \u{00b7} type / for commands".to_string(),
-            C_DIM,
-        ),
-        Mode::New | Mode::Rename => (app.input.clone(), C_TITLE),
-    };
+    // Middle line: "│ ❯ <text>▊ │". In Normal mode this is a dim hint; while
+    // typing it's the entered text followed by a block caret — the real terminal
+    // cursor is hidden for flicker-free diff rendering, so without a drawn caret
+    // the composer looks cursor-less. The mode (new/rename) shows on the border.
+    let composing = matches!(app.mode, Mode::New | Mode::Rename);
+    let avail = inner.saturating_sub(3);
     put(
         frame,
         box_top + 1,
@@ -2422,12 +2479,41 @@ fn draw_input(frame: &mut [String], app: &App, cols: u16, rows: u16) {
                 SetForegroundColor(C_ACCENT_DIM),
                 Print("  │"),
                 SetForegroundColor(C_ACCENT),
-                Print(" ❯ "),
-                SetForegroundColor(body_color),
-                Print(fit_cols(&body_text, inner.saturating_sub(3))),
-                SetForegroundColor(C_ACCENT_DIM),
-                Print("│")
+                Print(" ❯ ")
             );
+            if composing {
+                let text_avail = avail.saturating_sub(1); // one column for the caret
+                // Show the tail when the input outgrows the box so the end you're
+                // typing at stays visible; otherwise show it whole (no padding, so
+                // the caret sits right after the text).
+                let visible = if display_width(&app.input) <= text_avail {
+                    app.input.clone()
+                } else {
+                    fit_cols_tail(&app.input, text_avail)
+                };
+                let vis_w = display_width(&visible).min(text_avail);
+                let pad = avail.saturating_sub(vis_w + 1);
+                let _ = queue!(
+                    b,
+                    SetForegroundColor(C_TITLE),
+                    Print(visible),
+                    SetForegroundColor(C_ACCENT),
+                    SetAttribute(Attribute::Reverse),
+                    Print(" "),
+                    SetAttribute(Attribute::Reset),
+                    Print(" ".repeat(pad))
+                );
+            } else {
+                let _ = queue!(
+                    b,
+                    SetForegroundColor(C_DIM),
+                    Print(fit_cols(
+                        "press e or type to message codex \u{00b7} type / for commands",
+                        avail
+                    ))
+                );
+            }
+            let _ = queue!(b, SetForegroundColor(C_ACCENT_DIM), Print("│"));
         }),
     );
 
@@ -2544,7 +2630,13 @@ impl TerminalSession {
             return Ok(());
         }
         terminal::enable_raw_mode().context("enable raw mode")?;
-        if let Err(err) = execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture, Hide) {
+        if let Err(err) = execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste,
+            Hide
+        ) {
             terminal::disable_raw_mode().ok();
             return Err(err.into());
         }
@@ -2559,6 +2651,7 @@ impl TerminalSession {
         let screen_result = execute!(
             io::stdout(),
             Show,
+            DisableBracketedPaste,
             DisableMouseCapture,
             LeaveAlternateScreen
         );

@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 mod attach;
+mod autopilot;
 mod distill;
 mod progress;
 mod protocol;

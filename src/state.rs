@@ -406,10 +406,13 @@ pub fn codex_home_dir() -> PathBuf {
     home_dir().join(".codex")
 }
 
-// Map each codex session_id to its FIRST user message, read from codex's
-// append-only history.jsonl ({session_id, ts, text} per line, in chronological
-// order so the first occurrence wins). Best-effort: any error yields an empty
-// map and callers just keep the title they already have. Undocumented format.
+// Map each codex session_id to its first *genuine* user message, read from
+// codex's append-only history.jsonl ({session_id, ts, text} per line, in
+// chronological order so the first occurrence wins). Synthetic first turns —
+// slash-command echoes (<command-name>…) and codex's injected
+// <environment_context>/<user_instructions> blocks — are skipped so the derived
+// title is the user's real first line, not a marker. Best-effort: any error
+// yields an empty map and callers just keep the title they already have.
 pub fn codex_first_messages() -> std::collections::HashMap<String, String> {
     let mut map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let path = codex_home_dir().join("history.jsonl");
@@ -426,6 +429,9 @@ pub fn codex_first_messages() -> std::collections::HashMap<String, String> {
         ) else {
             continue;
         };
+        if is_synthetic_marker(text) {
+            continue; // a slash-command / injected-context turn — not a title
+        }
         map.entry(sid.to_string())
             .or_insert_with(|| text.to_string());
     }
