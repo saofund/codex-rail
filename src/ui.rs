@@ -447,6 +447,11 @@ fn manager_loop(terminal: &mut TerminalSession, app: &mut App) -> Result<()> {
     loop {
         if last_refresh.elapsed() >= REFRESH_INTERVAL {
             app.reload()?;
+            // Advance any autopilots (create/nudge pilots, deliver replies). If it
+            // acted, reload so a freshly-spawned pilot appears immediately.
+            if app.drive_autopilot() {
+                app.reload()?;
+            }
             last_refresh = Instant::now();
             render(app)?;
         }
@@ -710,6 +715,299 @@ impl App {
         }
     }
 
+    // Space on the selected session turns autopilot on/off. On, rail will answer
+    // that session for you (via a pilot session) whenever it finishes a turn.
+    fn toggle_autopilot(&mut self) {
+        let Some((id, adopted, title)) = self
+            .current()
+            .map(|s| (s.id.clone(), s.adopted, s.title.clone()))
+        else {
+            return;
+        };
+        if self.pilot_to_main.contains_key(&id) {
+            self.message = "that's a pilot — toggle autopilot on its main session".to_string();
+            return;
+        }
+        if adopted {
+            self.message = "attach this imported session once before autopiloting it".to_string();
+            return;
+        }
+        let on = self
+            .autopilot
+            .get(&id)
+            .map(|s| s.enabled)
+            .unwrap_or(false);
+        if on {
+            autopilot::remove(&id);
+            self.autopilot.remove(&id);
+            self.message = format!("autopilot off for \u{201c}{}\u{201d}", clip_title(&title));
+        } else {
+            // (re-)enable: fresh cycle, keep any existing pilot to reuse.
+            let mut st = autopilot::load(&id).unwrap_or_default();
+            st.enabled = true;
+            st.replies = 0;
+            st.phase = autopilot::Phase::Idle;
+            st.main_marker.clear();
+            st.pending_reply.clear();
+            st.last_reason = None;
+            autopilot::save(&id, &st);
+            self.message = format!(
+                "autopilot ON \u{2014} I'll answer \u{201c}{}\u{201d} for you (up to {} replies) \u{00b7} Space to stop",
+                clip_title(&title),
+                st.cap
+            );
+            self.autopilot.insert(id, st);
+        }
+    }
+
+    // Is this session alive and idle-waiting for you (Needs input)? The trigger
+    // condition for an autopilot reply.
+    fn session_needs_input(&self, id: &str) -> bool {
+        self.sessions
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| bucket_of(&self.activity, s) == Bucket::NeedsInput)
+            .unwrap_or(false)
+    }
+
+    fn session_alive(&self, id: &str) -> bool {
+        self.sessions
+            .iter()
+            .any(|s| s.id == id && s.status == STATUS_RUNNING)
+    }
+
+    fn session_socket(&self, id: &str) -> Option<String> {
+        self.sessions
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| s.socket.clone())
+    }
+
+    fn session_rollout(&self, id: &str) -> Option<String> {
+        self.sessions
+            .iter()
+            .find(|s| s.id == id)
+            .and_then(|s| s.codex_rollout_path.clone())
+    }
+
+    // Advance the autopilot reply cycle for every enabled main session, once per
+    // refresh. Returns true if it changed anything (spawned a pilot, injected a
+    // reply, paused) so the caller can reload + repaint. Cheap when idle.
+    fn drive_autopilot(&mut self) -> bool {
+        if self.autopilot.is_empty() {
+            return false;
+        }
+        let mains: Vec<String> = self
+            .autopilot
+            .iter()
+            .filter(|(_, st)| st.enabled)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut changed = false;
+        for id in mains {
+            changed |= self.drive_one_autopilot(&id);
+        }
+        changed
+    }
+
+    fn drive_one_autopilot(&mut self, main_id: &str) -> bool {
+        let mut st = match self.autopilot.get(main_id) {
+            Some(s) => s.clone(),
+            None => return false,
+        };
+        if !self.sessions.iter().any(|s| s.id == main_id) {
+            autopilot::remove(main_id); // main gone
+            self.autopilot.remove(main_id);
+            return true;
+        }
+        if st.replies >= st.cap {
+            let cap = st.cap;
+            return self.pause_autopilot(
+                main_id,
+                &mut st,
+                format!("reached the {cap}-reply limit \u{2014} your turn"),
+            );
+        }
+        let main_msg = self.preview.get(main_id).cloned().unwrap_or_default();
+        let mut changed = false;
+        match st.phase {
+            autopilot::Phase::Idle => {
+                // fire on a NEW completed main turn (and only when idle-waiting)
+                if self.session_needs_input(main_id)
+                    && !main_msg.is_empty()
+                    && main_msg != st.main_marker
+                {
+                    st.main_marker = main_msg.clone();
+                    match st.pilot_id.clone() {
+                        None => match self.spawn_pilot(main_id, &main_msg) {
+                            Some(pid) => {
+                                st.pilot_id = Some(pid);
+                                st.pilot_marker.clear();
+                                st.phase = autopilot::Phase::Generating;
+                                self.message = "autopilot: pilot thinking\u{2026}".to_string();
+                                changed = true;
+                            }
+                            None => {
+                                return self.pause_autopilot(
+                                    main_id,
+                                    &mut st,
+                                    "couldn't start the pilot session".to_string(),
+                                );
+                            }
+                        },
+                        Some(pid) => {
+                            // baseline the pilot's current reply, then nudge it
+                            st.pilot_marker = self
+                                .session_rollout(&pid)
+                                .and_then(|r| autopilot::last_agent_message_full(&r))
+                                .unwrap_or_default();
+                            match self.session_socket(&pid) {
+                                Some(sock) => {
+                                    let prompt = autopilot::continue_prompt(&main_msg);
+                                    match autopilot::inject(&sock, format!("{prompt}\r").as_bytes())
+                                    {
+                                        Ok(true) => {
+                                            st.phase = autopilot::Phase::Generating;
+                                            self.message =
+                                                "autopilot: pilot thinking\u{2026}".to_string();
+                                            changed = true;
+                                        }
+                                        // pilot busy/attached/transient -> retry next turn
+                                        _ => st.main_marker.clear(),
+                                    }
+                                }
+                                None => st.main_marker.clear(),
+                            }
+                        }
+                    }
+                }
+            }
+            autopilot::Phase::Generating => {
+                match st.pilot_id.clone() {
+                    Some(pid) if self.session_needs_input(&pid) => {
+                        let reply = self
+                            .session_rollout(&pid)
+                            .and_then(|r| autopilot::last_agent_message_full(&r))
+                            .unwrap_or_default();
+                        if !reply.is_empty() && reply != st.pilot_marker {
+                            match autopilot::parse_reply(&reply) {
+                                autopilot::Reply::Done => {
+                                    return self.pause_autopilot(
+                                        main_id,
+                                        &mut st,
+                                        "pilot judged the task complete".to_string(),
+                                    );
+                                }
+                                autopilot::Reply::HandBack(reason) => {
+                                    return self.pause_autopilot(main_id, &mut st, reason);
+                                }
+                                autopilot::Reply::Send(text) => {
+                                    st.pending_reply = text;
+                                    st.phase = autopilot::Phase::Delivering;
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                    Some(pid) if !self.session_alive(&pid) => {
+                        return self.pause_autopilot(
+                            main_id,
+                            &mut st,
+                            "pilot session exited".to_string(),
+                        );
+                    }
+                    Some(_) => {} // pilot still working
+                    None => st.phase = autopilot::Phase::Idle,
+                }
+            }
+            autopilot::Phase::Delivering => {
+                if let Some(sock) = self.session_socket(main_id) {
+                    // retries next tick if a human is attached (worker refuses us)
+                    if let Ok(true) =
+                        autopilot::inject(&sock, format!("{}\r", st.pending_reply).as_bytes())
+                    {
+                        st.replies += 1;
+                        st.pending_reply.clear();
+                        st.phase = autopilot::Phase::Idle;
+                        self.message = format!("autopilot: replied ({}/{})", st.replies, st.cap);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        autopilot::save(main_id, &st);
+        self.autopilot.insert(main_id.to_string(), st);
+        changed
+    }
+
+    // Disable autopilot for a main with a reason (cap hit, handback, pilot died);
+    // persists enabled=false + reason so the row shows why, and surfaces it.
+    fn pause_autopilot(
+        &mut self,
+        main_id: &str,
+        st: &mut autopilot::AutopilotState,
+        reason: String,
+    ) -> bool {
+        st.enabled = false;
+        st.phase = autopilot::Phase::Idle;
+        st.pending_reply.clear();
+        st.last_reason = Some(reason.clone());
+        autopilot::save(main_id, st);
+        self.autopilot.insert(main_id.to_string(), st.clone());
+        self.message = format!("autopilot paused: {reason}");
+        true
+    }
+
+    // Create the pilot session for a main: a real, visible codex session (grouped
+    // under its main in the list) whose task is to write the user's replies. Runs
+    // read-only + autonomous, pinned to the main's cwd, inheriting the user's model.
+    fn spawn_pilot(&mut self, main_id: &str, main_msg: &str) -> Option<String> {
+        let (main_cwd, main_title, rollout) = {
+            let m = self.sessions.iter().find(|s| s.id == main_id)?;
+            (
+                PathBuf::from(&m.cwd),
+                clip_title(&m.title),
+                m.codex_rollout_path.clone().unwrap_or_default(),
+            )
+        };
+        let style_path = latest_style_file()
+            .map(|f| state::distill_dir().join(f).to_string_lossy().to_string())
+            .unwrap_or_else(|| "(no distilled style file yet — use good judgment)".to_string());
+        let prompt = autopilot::initial_prompt(&style_path, main_id, &rollout, main_msg);
+        let _ = distill::ensure_trusted(&main_cwd);
+        // The pilot writes a reply — it doesn't need the user's deep-reasoning
+        // default, so run it lighter (faster per turn). Overridable.
+        let effort =
+            env::var("CODEX_RAIL_PILOT_EFFORT").unwrap_or_else(|_| "medium".to_string());
+        let mut codex_args = vec![
+            "-C".to_string(),
+            main_cwd.to_string_lossy().to_string(),
+            "-s".to_string(),
+            "read-only".to_string(),
+            "-a".to_string(),
+            "never".to_string(),
+        ];
+        if !effort.is_empty() {
+            codex_args.push("-c".to_string());
+            codex_args.push(format!("model_reasoning_effort={effort}"));
+        }
+        // Optional pilot model override (else inherits the user's config default).
+        if let Ok(model) = env::var("CODEX_RAIL_PILOT_MODEL") {
+            if !model.is_empty() {
+                codex_args.push("-m".to_string());
+                codex_args.push(model);
+            }
+        }
+        let title = format!("\u{21b3} pilot \u{00b7} {main_title}");
+        match create_session_in(&title, Some(prompt), Some(main_cwd), codex_args, None) {
+            Ok(sess) => Some(sess.id),
+            Err(err) => {
+                self.message = format!("pilot launch failed: {err:#}");
+                None
+            }
+        }
+    }
+
     fn reload(&mut self) -> Result<()> {
         let selected_id = self.current().map(|s| s.id.clone());
         self.sessions = state::load_sessions()?;
@@ -923,6 +1221,37 @@ impl App {
         });
         self.sessions = decorated.into_iter().map(|(_, _, _, s)| s).collect();
         self.activity = activity;
+        self.regroup_pilots();
+    }
+
+    // Pull each pilot session out of its bucket-sorted slot and reinsert it
+    // directly after the main it answers, so the list reads as a group ("main"
+    // then its indented "↳ pilot"). Mirrors nothing in codex — purely rail's view.
+    fn regroup_pilots(&mut self) {
+        if self.pilot_to_main.is_empty() {
+            return;
+        }
+        let pilot_ids: std::collections::HashSet<String> =
+            self.pilot_to_main.keys().cloned().collect();
+        let mut pilots: Vec<SessionState> = Vec::new();
+        self.sessions.retain(|s| {
+            if pilot_ids.contains(&s.id) {
+                pilots.push(s.clone());
+                false
+            } else {
+                true
+            }
+        });
+        for pilot in pilots {
+            match self
+                .pilot_to_main
+                .get(&pilot.id)
+                .and_then(|mid| self.sessions.iter().position(|s| &s.id == mid))
+            {
+                Some(pos) => self.sessions.insert(pos + 1, pilot),
+                None => self.sessions.push(pilot), // orphan pilot (main removed)
+            }
+        }
     }
 
     fn current(&self) -> Option<&SessionState> {
@@ -1020,10 +1349,12 @@ fn handle_normal_key(key: KeyEvent, app: &mut App, terminal: &mut TerminalSessio
             app.stop_confirm = None;
             app.exit_confirm = None;
         }
-        // SPACE is reserved for the upcoming auto-reply toggle. Swallow it here
-        // so it doesn't fall through to the "type any key to start a new
-        // session" arm below (a stray space shouldn't open the composer).
-        KeyCode::Char(' ') if key.modifiers.is_empty() => {}
+        // SPACE toggles autopilot on the selected session (rail answers it for
+        // you via a pilot session). Swallowed here so it never falls through to
+        // the "type any key to start a new session" arm below.
+        KeyCode::Char(' ') if key.modifiers.is_empty() => {
+            app.toggle_autopilot();
+        }
         KeyCode::Char(ch) if key.modifiers.is_empty() && !ch.is_control() => {
             app.mode = Mode::New;
             app.input.clear();
@@ -1118,7 +1449,7 @@ fn run_slash(app: &mut App) -> Result<bool> {
         }
         SlashCmd::Help => {
             app.message =
-                "↑↓ move · Enter attach · e new · / commands · Ctrl+X twice stop · Esc twice quit"
+                "↑↓ move · Enter attach · e new · Space autopilot · / commands · Ctrl+X twice stop · Esc twice quit"
                     .to_string();
         }
         SlashCmd::Quit => return Ok(true),
@@ -1742,6 +2073,35 @@ fn title_from_message(msg: &str) -> String {
         .collect()
 }
 
+// Shorten a title for a one-line status message.
+fn clip_title(s: &str) -> String {
+    let t: String = s.chars().take(30).collect();
+    if s.chars().count() > 30 {
+        format!("{t}\u{2026}")
+    } else {
+        t
+    }
+}
+
+// The newest distilled style file (style-vNNN.md) under distill_dir, if any — the
+// pilot reads it to answer in the user's voice. None until the user has distilled.
+fn latest_style_file() -> Option<String> {
+    let mut best: Option<(u32, String)> = None;
+    for entry in std::fs::read_dir(state::distill_dir()).ok()?.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if let Some(v) = name
+            .strip_prefix("style-v")
+            .and_then(|r| r.strip_suffix(".md"))
+            .and_then(|r| r.parse::<u32>().ok())
+        {
+            if best.as_ref().map(|(bv, _)| v > *bv).unwrap_or(true) {
+                best = Some((v, name));
+            }
+        }
+    }
+    best.map(|(_, n)| n)
+}
+
 // Auto-numbered title for a session created without any typed text. Picks one
 // past the highest existing "Session N" so repeated empty-creates don't collide.
 fn default_session_title(sessions: &[SessionState]) -> String {
@@ -2269,6 +2629,18 @@ fn draw_sessions(frame: &mut [String], app: &mut App, cols: u16, rows: u16) {
                     .get(&s.id)
                     .cloned()
                     .unwrap_or_else(|| home_tilde(&s.cwd));
+                // Autopilot badge: an active main leads its preview with "⟳ N/cap";
+                // a paused one shows why it handed back (so the row says "your turn").
+                let preview = match app.autopilot.get(&s.id) {
+                    Some(ap) if ap.enabled => {
+                        format!("\u{27f3} auto {}/{}  {}", ap.replies, ap.cap, preview)
+                    }
+                    Some(ap) => format!(
+                        "\u{23f8} autopilot \u{2014} {}",
+                        ap.last_reason.as_deref().unwrap_or("your turn")
+                    ),
+                    None => preview,
+                };
                 put(frame, y, session_row_line(s, bucket, &preview, selected, cw, title_w));
                 app.rows.push((y, *index));
             }
@@ -2570,7 +2942,7 @@ fn draw_hint(frame: &mut [String], app: &App, cols: u16, rows: u16) {
     } else {
         let hint = match app.mode {
             Mode::Normal => {
-                "↑↓ move · Enter attach · e new · / commands · Ctrl+R rename · Ctrl+X twice stop · Esc twice quit"
+                "↑↓ move · Enter attach · e new · Space autopilot · / commands · Ctrl+R rename · Ctrl+X twice stop · Esc twice quit"
             }
             Mode::New => "Enter start · Esc cancel · / for commands · empty = blank session",
             Mode::Rename => "Enter save · Esc cancel",

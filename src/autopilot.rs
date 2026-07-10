@@ -160,7 +160,8 @@ RIGHT NOW, the session just finished a turn and said:\n---\n{last}\n---\n\n\
 OUTPUT CONTRACT — obey exactly:\n\
 - Output ONLY the user's next reply (the raw text to send), nothing else. No preamble, no explanation, no quotes.\n\
 - Match the user's voice (their language, their brevity, their steering).\n\
-- If the task looks COMPLETE, output exactly: [DONE]\n\
+- If the session ASKS you a question or offers a choice, ANSWER it — do not stop.\n\
+- Output exactly [DONE] ONLY when the whole task is finished AND the session is not asking you anything.\n\
 - If something risky/irreversible/destructive is proposed, or you are genuinely unsure what the user would want, output exactly: [HANDBACK] <one-line reason>\n\
 Write the reply now.",
         style = style_path,
@@ -176,7 +177,8 @@ Write the reply now.",
 pub fn continue_prompt(main_last_msg: &str) -> String {
     format!(
         "看最新回复，继续。The session just said:\n---\n{last}\n---\n\
-Write the user's next reply now. Same output contract: reply text ONLY, or [DONE] / [HANDBACK] <reason>.",
+Write the user's next reply now (in their voice). If it asks a question or offers a choice, ANSWER it. \
+Reply text ONLY — or [DONE] only if finished and not being asked anything, or [HANDBACK] <reason>.",
         last = clip(main_last_msg, 4000)
     )
 }

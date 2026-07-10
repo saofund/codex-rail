@@ -918,6 +918,24 @@ def audit(rail, pngdir=None):
     finally:
         os.environ.pop("CODEX_RAIL_FAKE_UPDATE", None)
 
+    # 25) Space toggles autopilot on the selected session: an "⟳ auto N/cap" badge
+    #     and an "autopilot ON" status appear; Space again turns it off.
+    c = Cockpit(rail, codex=FAKE_SLEEP).boot()
+    try:
+        c.seed_running_worker("ap-1", "AUTOPILOT ME")
+        c.wait_until(lambda: c.row_with("AUTOPILOT ME") is not None, timeout=8)
+        c.key(b" ", 0.5)                                   # Space -> autopilot ON
+        on_badge = any("auto 0/" in r for r in c.rows())
+        on_status = any("autopilot on" in r.lower() for r in c.rows())
+        c.key(b" ", 0.5)                                   # Space -> OFF
+        off_badge = not any("auto 0/" in r for r in c.rows())
+        off_status = any("autopilot off" in r.lower() for r in c.rows())
+        check("autopilot: Space toggles it (⟳ badge + status on, then off)",
+              on_badge and on_status and off_badge and off_status,
+              f"on={on_badge}/{on_status} off={off_badge}/{off_status}")
+    finally:
+        c.close()
+
     # ---- summary
     npass = sum(1 for _, ok, _ in results if ok)
     print(f"\n==== {npass}/{len(results)} checks PASS ====")

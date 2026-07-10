@@ -111,7 +111,7 @@ Manager screen (the bottom line always shows the relevant keys):
 - `Ctrl+D`: distill your response style **and problem-solving logic** from your
   past codex *and* Claude Code conversations (see below)
 - `Esc` twice within 2s: leave the manager (sessions keep running)
-- `Space` is reserved for a future feature and does nothing here
+- `Space`: toggle **autopilot** on the selected session (see below)
 
 Only sections that actually have sessions are shown (an empty *Working* or
 *Needs input* block is hidden rather than drawn as "none"), and the list floats
@@ -161,6 +161,33 @@ over time. (Everything stays local under `~/.config/codex-rail` and is never
 committed.)
 
 Prompts are English-only for now.
+
+## Autopilot
+
+Press **`Space`** on a session to hand it to **autopilot** — rail answers it for
+you while you're away. Under the hood rail launches a **pilot**: a real, visible
+codex session (it appears grouped right under its main as `↳ pilot · …`, and you
+can attach to it to watch or step in at any time). Each time the main session
+finishes a turn and waits for you, rail nudges the pilot, which reads your
+distilled style (`style-vNNN.md`, from `Ctrl+D`) plus the session's latest
+message and writes the reply *in your voice and judgment*; rail then types that
+reply back into the main session — the same keystrokes you would.
+
+It stays in your control:
+
+- The main row shows a live badge — `⟳ auto N/cap` while active, or why it
+  **handed back** to you when it pauses.
+- The pilot hands back (and autopilot stops) when the task looks **done**, when
+  something **risky/irreversible** is proposed, when it's **unsure**, or after a
+  **reply cap** (default 8; `CODEX_RAIL_AUTOPILOT_CAP`) — so it never runs away.
+- Attach to the main at any time; while you're attached rail won't inject, so you
+  can just take over. `Space` again turns autopilot off.
+- The pilot runs **read-only** and at a lighter reasoning effort for speed
+  (`CODEX_RAIL_PILOT_EFFORT`, `CODEX_RAIL_PILOT_MODEL` to override); it inherits
+  your codex model otherwise.
+
+Autopilot is best for keeping a session moving through routine continuations, not
+for high-stakes judgment calls — which is exactly what the hand-back rules protect.
 
 ## Install
 
