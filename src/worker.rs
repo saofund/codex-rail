@@ -414,6 +414,16 @@ fn is_current_client(attached: &Option<(u64, UnixStream)>, client_id: u64) -> bo
 fn signal_child(pid: Option<u32>, signal: libc::c_int) {
     if let Some(pid) = pid {
         unsafe {
+            // Signal the child's whole process GROUP, not just the pid. codex's npm
+            // launcher runs the real codex binary as a grandchild (and codex spawns
+            // sub-agent codex); killing only the direct pid leaks them, and leaked
+            // codex accumulate and lock codex's shared ~/.codex sqlite state. The PTY
+            // gave the child its own session/group, so -pgid can't hit us — but guard
+            // against ever signalling our own group just in case.
+            let pgid = libc::getpgid(pid as libc::pid_t);
+            if pgid > 1 && pgid != libc::getpgrp() {
+                libc::kill(-pgid, signal);
+            }
             libc::kill(pid as libc::pid_t, signal);
         }
     }

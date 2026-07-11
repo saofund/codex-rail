@@ -648,6 +648,10 @@ struct DistillJob {
 
 impl App {
     fn load() -> Result<Self> {
+        // Reap rail's own stale worker trees up front (orphaned/exited/duplicate),
+        // so leftover codex don't pile up and lock codex's shared ~/.codex sqlite
+        // state — the "database is locked" failure. See reap_orphan_workers.
+        let reaped = reap_orphan_workers();
         let mut app = Self {
             sessions: Vec::new(),
             selected: 0,
@@ -696,6 +700,12 @@ impl App {
         app.load_autopilot();
         app.refresh_derived();
         app.sort_for_display();
+        if reaped > 0 {
+            app.message = format!(
+                "cleaned up {reaped} stale worker{} (freed codex's local db)",
+                if reaped == 1 { "" } else { "s" }
+            );
+        }
         Ok(app)
     }
 
@@ -2406,21 +2416,176 @@ fn stop_with_confirmation(app: &mut App) -> Result<()> {
     Ok(())
 }
 
-// Kill a session's worker (and its codex child) by the pids recorded in its own
-// state file — the fallback when the worker's socket is gone. SIGTERM lets the
-// worker reap its child and clean up; the row flips to Stopped on the next reload.
+// Kill a session's worker AND its codex tree by the pids recorded in its own state
+// file — the fallback when the worker's socket is gone. Signals the whole process
+// GROUP of each pid (codex's launcher runs the real codex + sub-agents as
+// descendants; killing only the direct pid leaks them). SIGTERM only.
 fn kill_session_pids(session: &SessionState) -> bool {
     let mut any = false;
-    for pid in [session.child_pid, session.worker_pid].into_iter().flatten() {
-        if pid > 1 {
-            // SAFETY: kill(2) with a pid from our own state file; SIGTERM only.
-            unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+    unsafe {
+        let my = libc::getpgrp();
+        for pid in [session.child_pid, session.worker_pid].into_iter().flatten() {
+            if pid <= 1 {
+                continue;
             }
+            let pgid = libc::getpgid(pid as libc::pid_t);
+            if pgid > 1 && pgid != my {
+                libc::kill(-pgid, libc::SIGTERM);
+            }
+            libc::kill(pid as libc::pid_t, libc::SIGTERM);
             any = true;
         }
     }
     any
+}
+
+// Direct children of `pid`, read from /proc PPid. Used to find a worker's codex
+// launcher so its whole group can be killed.
+fn proc_children_of(pid: i32) -> Vec<i32> {
+    let mut kids = Vec::new();
+    let Ok(rd) = std::fs::read_dir("/proc") else {
+        return kids;
+    };
+    for e in rd.flatten() {
+        let Some(cpid) = e
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{cpid}/stat")) {
+            // comm (2nd field, in parens) may contain spaces/parens — parse the
+            // fields after the last ')': state, then ppid.
+            if let Some(rp) = stat.rfind(')') {
+                let mut it = stat[rp + 1..].split_whitespace();
+                let _state = it.next();
+                if it.next().and_then(|s| s.parse::<i32>().ok()) == Some(pid) {
+                    kids.push(cpid);
+                }
+            }
+        }
+    }
+    kids
+}
+
+// Kill a rail worker's whole codex tree, then the worker itself. codex's launcher
+// child runs the real codex (+ sub-agents) in its own process group, so -pgid on
+// that child takes the subtree; then SIGTERM the worker. SIGTERM only.
+fn kill_worker_tree(worker_pid: i32) {
+    unsafe {
+        let my = libc::getpgrp();
+        for child in proc_children_of(worker_pid) {
+            let pgid = libc::getpgid(child as libc::pid_t);
+            if pgid > 1 && pgid != my {
+                libc::kill(-pgid, libc::SIGTERM);
+            }
+            libc::kill(child as libc::pid_t, libc::SIGTERM);
+        }
+        if worker_pid > 1 {
+            libc::kill(worker_pid as libc::pid_t, libc::SIGTERM);
+        }
+    }
+}
+
+// True only when the `rail --worker` at `pid` belongs to THIS manager's data dir,
+// determined from its environ (the data dir is XDG_DATA_HOME/codex-rail, else
+// HOME/.local/share/codex-rail — the same resolution as state::data_dir). Any
+// unreadable environ or mismatch returns false, so the reaper NEVER touches a
+// worker it can't prove is its own (a different install, or a test harness).
+fn worker_in_my_data_dir(pid: i32, my_data: &Path) -> bool {
+    let Ok(environ) = std::fs::read(format!("/proc/{pid}/environ")) else {
+        return false;
+    };
+    let mut xdg: Option<String> = None;
+    let mut home: Option<String> = None;
+    for kv in environ.split(|b| *b == 0) {
+        if let Some(rest) = kv.strip_prefix(b"XDG_DATA_HOME=") {
+            xdg = Some(String::from_utf8_lossy(rest).into_owned());
+        } else if let Some(rest) = kv.strip_prefix(b"HOME=") {
+            home = Some(String::from_utf8_lossy(rest).into_owned());
+        }
+    }
+    let their_data = match xdg.filter(|x| !x.is_empty()) {
+        Some(x) => PathBuf::from(x).join("codex-rail"),
+        None => match home.filter(|h| !h.is_empty()) {
+            Some(h) => PathBuf::from(h).join(".local/share").join("codex-rail"),
+            None => return false,
+        },
+    };
+    their_data == *my_data
+}
+
+// Reap rail's OWN stale worker processes so leftover codex don't pile up and lock
+// codex's shared ~/.codex sqlite state (the "database is locked" failure). A worker
+// is stale when its session dir is gone (removed), its session already
+// exited/failed, or it's a DUPLICATE for a session whose current worker is a
+// different pid. Each stale worker is killed WITH its codex tree. Never touches the
+// live worker of a running session, and only ever signals rail's own `--worker`
+// processes (found by cmdline) — never a user's direct codex or a codex sub-agent.
+fn reap_orphan_workers() -> usize {
+    let me = std::process::id() as i32;
+    let my_data = state::data_dir();
+    let mut by_id: std::collections::HashMap<String, Vec<i32>> = std::collections::HashMap::new();
+    let Ok(rd) = std::fs::read_dir("/proc") else {
+        return 0;
+    };
+    for e in rd.flatten() {
+        let Some(pid) = e
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if pid == me {
+            continue;
+        }
+        let Ok(cmd) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        let parts: Vec<String> = cmd
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect();
+        let is_worker = parts.first().map(|p| p.ends_with("rail")).unwrap_or(false)
+            && parts.iter().any(|p| p == "--worker");
+        if !is_worker {
+            continue;
+        }
+        // SAFETY-CRITICAL: only ever consider workers that belong to THIS manager's
+        // data dir (checked via their environ). Without this, a manager with a
+        // different/isolated XDG_DATA_HOME (a test harness, a second install) would
+        // see every OTHER manager's workers as "no jobs dir here" and reap them —
+        // killing unrelated live sessions. Skip anything we can't prove is ours.
+        if !worker_in_my_data_dir(pid, &my_data) {
+            continue;
+        }
+        if let Some(pos) = parts.iter().position(|p| p == "--worker") {
+            if let Some(id) = parts.get(pos + 1) {
+                by_id.entry(id.clone()).or_default().push(pid);
+            }
+        }
+    }
+    let mut reaped = 0;
+    for (id, pids) in by_id {
+        let st = state::read_state(&id).ok();
+        let exists = st.is_some();
+        let exited = st
+            .as_ref()
+            .map(|s| matches!(s.status.as_str(), STATUS_EXITED | STATUS_FAILED))
+            .unwrap_or(false);
+        let cur = st.as_ref().and_then(|s| s.worker_pid).map(|p| p as i32);
+        for pid in pids {
+            if exists && !exited && cur == Some(pid) {
+                continue; // the live session's current worker — keep it
+            }
+            kill_worker_tree(pid);
+            reaped += 1;
+        }
+    }
+    reaped
 }
 
 fn confirm_exit(app: &mut App) -> bool {

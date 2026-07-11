@@ -957,6 +957,52 @@ def audit(rail, pngdir=None):
     finally:
         c.close()
 
+    # 27) SAFETY: the startup orphan-reaper must ONLY touch its own data dir. A
+    #     worker in a DIFFERENT data dir (another install / the user's real rail)
+    #     must survive a manager boot. (Regression for a scoping bug that once
+    #     reaped live sessions across data dirs.)
+    byroot = "/tmp/rc-bystdr-" + str(os.getpid())
+    bydata, byrun, byhome = byroot + "/data", byroot + "/run", byroot + "/home"
+    byjobs = bydata + "/codex-rail/jobs"
+    for d in (byjobs, byrun, byhome):
+        os.makedirs(d, exist_ok=True)
+    bsid = "bystander"
+    now = int(time.time())
+    os.makedirs(f"{byjobs}/{bsid}", exist_ok=True)
+    json.dump({"id": bsid, "title": "BYST", "cwd": "/tmp", "codex": FAKE_SLEEP, "status": "starting",
+               "worker_pid": None, "child_pid": None, "socket": f"{byrun}/{bsid}.sock",
+               "created_at": now, "updated_at": now, "exit_code": None, "last_error": None,
+               "codex_session_id": None, "codex_rollout_path": None, "initial_prompt": None,
+               "title_pinned": False, "last_output_at": 0},
+              open(f"{byjobs}/{bsid}/state.json", "w"))
+    json.dump({"title": "BYST", "title_pinned": False}, open(f"{byjobs}/{bsid}/label.json", "w"))
+    byenv = os.environ.copy()
+    byenv.update({"XDG_DATA_HOME": bydata, "XDG_RUNTIME_DIR": byrun, "HOME": byhome,
+                  "CODEX_RAIL_CODEX": FAKE_SLEEP})
+    byw = subprocess.Popen([rail, "--worker", bsid], cwd="/tmp", env=byenv,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    try:
+        for _ in range(40):
+            try:
+                if json.load(open(f"{byjobs}/{bsid}/state.json")).get("child_pid"):
+                    break
+            except Exception:
+                pass
+            time.sleep(0.1)
+        shutil.rmtree(f"{byjobs}/{bsid}", ignore_errors=True)   # orphan it in ITS OWN dir
+        time.sleep(0.3)
+        c = Cockpit(rail, codex=FAKE_SLEEP).boot()               # a manager in a DIFFERENT data dir
+        try:
+            survived = byw.poll() is None
+            check("reaper safety: does NOT reap a worker from another data dir", survived,
+                  f"bystander_pid={byw.pid} survived={survived}")
+        finally:
+            c.close()
+    finally:
+        try: byw.kill()
+        except Exception: pass
+        shutil.rmtree(byroot, ignore_errors=True)
+
     # ---- summary
     npass = sum(1 for _, ok, _ in results if ok)
     print(f"\n==== {npass}/{len(results)} checks PASS ====")
