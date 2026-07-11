@@ -221,17 +221,24 @@ on `PATH`.
   - `state.json` — worker-owned runtime (status, codex id, rollout path, pids)
   - `label.json` — manager-owned title + pin flag (authoritative over the title)
   - `output.log` — per-session terminal output
+  - `.locks/<id>.init.lock` — serializes manager resume/remove for one session
+  - `.locks/<id>.worker.lock` — held for the lifetime of the session worker
+  - `.stop-<generation>.request` — socket-independent, generation-scoped stop fallback
 - Sockets: `$XDG_RUNTIME_DIR/codex-rail` (or `/tmp/codex-rail-$UID`)
 - Distillation: `$XDG_CONFIG_HOME/codex-rail/distill` (or `~/.config/codex-rail/distill`)
   - `style-vNNN.md` — the versioned distilled style summaries
   - `corpus/` — the aggregated, codex-readable message chunks (regenerated each run)
 
-State and socket files are locked to the owner (`0600`/`0700`).
+State, socket, and distillation data are locked to the owner (`0600` files,
+`0700` directories). On startup rail also tightens permissions left by older
+versions without following symlinks outside its data directories.
 
 ## Limits
 
 - Unix-like systems only.
-- Only sessions launched by `rail` are managed.
+- Rail can adopt Codex histories created in the current working directory as
+  resumable rows. Live process control is limited to sessions launched or
+  resumed through rail.
 - One active attachment per session; a second attach is refused until the first
   detaches.
 - Status and title sync rely on codex's on-disk transcript format, which is

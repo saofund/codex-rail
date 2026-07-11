@@ -21,10 +21,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 RAIL = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 and not sys.argv[1].startswith("-") \
        else os.path.join(REPO, "target/release/rail")
-JOBTMP = os.environ.get("CLAUDE_JOB_DIR", "/tmp") + "/tmp" if os.environ.get("CLAUDE_JOB_DIR") \
-         else "/data/wuyitao/folder_113_train/.docker/home/.claude/jobs/ea952819/tmp"
 FAKE_STREAM = os.path.join(HERE, "fakecodex")            # streams "tick" forever (a live turn)
-FAKE_SLEEP = JOBTMP + "/fakecodex_sleep.sh"              # quiet long-lived child
+FAKE_SLEEP = os.path.join(HERE, "fakecodex_sleep")       # quiet long-lived child
 
 COLS, ROWS = 110, 40
 
@@ -68,8 +66,9 @@ class Cockpit:
         self._zombies = []
 
     # ---- lifecycle -----------------------------------------------------------
-    def boot(self, settle=1.8):
-        shutil.rmtree(self.root, ignore_errors=True)
+    def boot(self, settle=1.8, reset=True):
+        if reset:
+            shutil.rmtree(self.root, ignore_errors=True)
         for d in (self.jobs, self.run, self.home):
             os.makedirs(d, exist_ok=True)
         env = os.environ.copy()
@@ -269,7 +268,8 @@ class Cockpit:
     def _base(self, sid, title, **over):
         now = int(time.time())
         st = {"id": sid, "title": title, "cwd": "/tmp", "codex": self.codex, "status": "running",
-              "worker_pid": None, "child_pid": None, "socket": f"{self.run}/{sid}.sock",
+              "worker_pid": None, "child_pid": None,
+              "socket": f"{self.run}/codex-rail/{sid}.sock",
               "created_at": now, "updated_at": now, "exit_code": None, "last_error": None,
               "codex_session_id": None, "codex_rollout_path": None, "initial_prompt": None,
               "title_pinned": False, "last_output_at": 0}
@@ -413,7 +413,7 @@ def audit(rail, pngdir=None):
     c = Cockpit(rail, codex=FAKE_STREAM).boot()
     try:
         c.new("investigate the thing")
-        attached = any("tick" in r for r in c.rows())
+        attached = c.wait_until(lambda: any("tick" in r for r in c.rows()), timeout=8)
         snap(c, "02_attached")
         c.key(b"\x1a", 1.0)                      # Ctrl-Z detach
         listed = c.row_with("investigate the thing") is not None
@@ -665,9 +665,12 @@ def audit(rail, pngdir=None):
         cfg = os.path.join(c.home, ".codex", "config.toml")
         distill_dir = os.path.join(c.home, ".config", "codex-rail", "distill")
         trust_ok = os.path.exists(cfg) and f'[projects."{distill_dir}"]' in open(cfg).read()
+        private = all((os.stat(d).st_mode & 0o777) == 0o700
+                      for d in (os.path.dirname(distill_dir), distill_dir, corpus)) \
+                  and all((os.stat(p).st_mode & 0o777) == 0o600 for p in chunks)
         check("distill (Ctrl+D): corpus aggregated + autonomous session + dir pre-trusted",
-              made and shown and args_ok and trust_ok,
-              f"chunks={len(chunks)} shown={shown} args_ok={args_ok} trust_ok={trust_ok}")
+              made and shown and args_ok and trust_ok and private,
+              f"chunks={len(chunks)} shown={shown} args_ok={args_ok} trust_ok={trust_ok} private={private}")
         snap(c, "15_distill")
     finally:
         c.close()
@@ -937,24 +940,34 @@ def audit(rail, pngdir=None):
         c.close()
 
     # 26) a live session whose socket is GONE (e.g. XDG_RUNTIME_DIR was cleared
-    #     while the worker stayed alive) can still be stopped — Ctrl+X twice falls
-    #     back to killing the worker by its recorded pid instead of wedging.
+    #     while the worker stayed alive) can still be stopped. Poison the persisted
+    #     pid too: the generation-scoped control marker must work without /proc,
+    #     which is the recovery path used on macOS.
     c = Cockpit(rail, codex=FAKE_SLEEP).boot()
     try:
         c.seed_running_worker("sock-gone", "STUCK")
         c.wait_until(lambda: c.row_with("STUCK") is not None, timeout=8)
+        worker = c._pid("sock-gone", "worker_pid")
         child = c._pid("sock-gone", "child_pid")
-        sock = json.load(open(f"{c.jobs}/sock-gone/state.json"))["socket"]
+        state_path = f"{c.jobs}/sock-gone/state.json"
+        persisted = json.load(open(state_path))
+        sock = persisted["socket"]
         if sock and os.path.exists(sock):
             os.remove(sock)                                  # vanish the socket
+        persisted["worker_pid"] = 4294967295                 # unusable as a pid
+        json.dump(persisted, open(state_path, "w"), indent=2)
         c.key(b"\x18", 0.5); c.key(b"\x18", 1.2)             # Ctrl+X twice -> stop
         def _alive(p):
             try: os.kill(p, 0); return True
             except OSError: return False
         killed = child is not None and not _alive(child)
-        check("stop: socket-gone live session is killed by the pid fallback",
+        check("stop: socket-gone worker stops via generation-scoped control (no pid/proc)",
               killed, f"child={child} killed={killed}")
     finally:
+        try:
+            if worker: os.kill(worker, signal.SIGKILL)
+        except Exception:
+            pass
         c.close()
 
     # 27) SAFETY: the startup orphan-reaper must ONLY touch its own data dir. A
@@ -981,10 +994,12 @@ def audit(rail, pngdir=None):
                   "CODEX_RAIL_CODEX": FAKE_SLEEP})
     byw = subprocess.Popen([rail, "--worker", bsid], cwd="/tmp", env=byenv,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    bychild = None
     try:
         for _ in range(40):
             try:
-                if json.load(open(f"{byjobs}/{bsid}/state.json")).get("child_pid"):
+                bychild = json.load(open(f"{byjobs}/{bsid}/state.json")).get("child_pid")
+                if bychild:
                     break
             except Exception:
                 pass
@@ -1001,7 +1016,113 @@ def audit(rail, pngdir=None):
     finally:
         try: byw.kill()
         except Exception: pass
+        if bychild:
+            try: os.kill(bychild, signal.SIGKILL)
+            except Exception: pass
         shutil.rmtree(byroot, ignore_errors=True)
+
+    # 28) Two managers can race to resume the same session. Only one worker may
+    #     own it: the loser exits without spawning a second codex, rewriting
+    #     state, or unlinking the winner's socket.
+    c = Cockpit(rail, codex=FAKE_SLEEP).boot()
+    try:
+        sid = "lock-race"
+        c.seed_running_worker(sid, "LOCK RACE", codex=FAKE_SLEEP)
+        before = json.load(open(f"{c.jobs}/{sid}/state.json"))
+        socket_before = os.stat(before["socket"]).st_ino
+        env = os.environ.copy()
+        env.update({"XDG_DATA_HOME": c.data, "XDG_RUNTIME_DIR": c.run, "HOME": c.home,
+                    "CODEX_RAIL_CODEX": FAKE_SLEEP})
+        loser = subprocess.Popen([rail, "--worker", sid], cwd="/tmp", env=env,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 start_new_session=True)
+        loser_exited = loser.wait(timeout=5) == 0
+        time.sleep(0.4)
+        after = json.load(open(f"{c.jobs}/{sid}/state.json"))
+        unchanged = all(after.get(k) == before.get(k)
+                        for k in ("worker_pid", "child_pid", "status", "last_error"))
+        same_socket = os.path.exists(after["socket"]) \
+                      and os.stat(after["socket"]).st_ino == socket_before
+        winner_alive = c.alive(sid, "worker_pid") and c.alive(sid, "child_pid")
+        check("worker lock: duplicate worker loses without touching the live session",
+              loser_exited and unchanged and same_socket and winner_alive,
+              f"loser_exited={loser_exited} unchanged={unchanged} same_socket={same_socket} winner_alive={winner_alive}")
+    finally:
+        c.close()
+
+    # 29) A non-socket at the canonical path is never unlinked. The worker owns
+    #     its state by this point, so the setup failure must be visible instead
+    #     of leaving a silent/stuck `starting` row.
+    c = Cockpit(rail, codex=FAKE_SLEEP).boot()
+    try:
+        sid = "blocked-socket"
+        c.seed(sid, "BLOCKED SOCKET", status="starting", codex=FAKE_SLEEP)
+        socket_path = f"{c.run}/codex-rail/{sid}.sock"
+        os.makedirs(os.path.dirname(socket_path), exist_ok=True)
+        open(socket_path, "w").write("do not delete")
+        env = os.environ.copy()
+        env.update({"XDG_DATA_HOME": c.data, "XDG_RUNTIME_DIR": c.run, "HOME": c.home,
+                    "CODEX_RAIL_CODEX": FAKE_SLEEP})
+        failed = subprocess.Popen([rail, "--worker", sid], cwd="/tmp", env=env,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                  start_new_session=True)
+        failed.wait(timeout=5)
+        after = json.load(open(f"{c.jobs}/{sid}/state.json"))
+        visible = after.get("status") == "failed" and "non-socket" in (after.get("last_error") or "")
+        preserved = os.path.isfile(socket_path) and open(socket_path).read() == "do not delete"
+        check("worker setup failure: non-socket path is preserved and reported",
+              visible and preserved, f"visible={visible} preserved={preserved} state={after.get('status')}")
+    finally:
+        c.close()
+
+    # 30) Two full manager TUIs racing Enter on the same stopped row must converge
+    #     on one worker/one codex start. init.lock protects bootstrap state while
+    #     worker.lock protects the lifetime owner.
+    shared = "/tmp/rc-two-managers-" + str(os.getpid())
+    count_file = shared + "/codex-starts"
+    os.environ["CODEX_RAIL_FAKE_COUNT"] = count_file
+    c1 = c2 = None
+    try:
+        c1 = Cockpit(rail, root=shared, codex=FAKE_SLEEP).boot()
+        c2 = Cockpit(rail, root=shared, codex=FAKE_SLEEP).boot(reset=False)
+        sid = "manager-race"
+        c1.seed(sid, "MANAGER RACE", status="exited", codex=FAKE_SLEEP)
+        c1.wait_until(lambda: c1.row_with("MANAGER RACE") is not None, timeout=6)
+        c2.wait_until(lambda: c2.row_with("MANAGER RACE") is not None, timeout=6)
+        os.write(c1.m, b"\r")
+        os.write(c2.m, b"\r")
+        end = time.time() + 8
+        starts = []
+        while time.time() < end:
+            if os.path.exists(count_file):
+                starts = [line for line in open(count_file).read().splitlines() if line]
+                if starts:
+                    break
+            time.sleep(0.1)
+        time.sleep(0.5)
+        if os.path.exists(count_file):
+            starts = [line for line in open(count_file).read().splitlines() if line]
+        os.write(c1.m, b"\x1a")
+        os.write(c2.m, b"\x1a")
+        time.sleep(0.8)
+        if os.path.exists(count_file):
+            starts = [line for line in open(count_file).read().splitlines() if line]
+        state_after = json.load(open(f"{c1.jobs}/{sid}/state.json"))
+        one_start = len(starts) == 1
+        owned = state_after.get("status") == "running" \
+                and state_after.get("worker_lock_protocol") is True \
+                and state_after.get("worker_pid") \
+                and state_after.get("child_pid")
+        check("manager race: two simultaneous resumes start exactly one codex",
+              one_start and owned,
+              f"starts={starts} status={state_after.get('status')} worker={state_after.get('worker_pid')} child={state_after.get('child_pid')}")
+    finally:
+        os.environ.pop("CODEX_RAIL_FAKE_COUNT", None)
+        if c1:
+            c1.close()
+        if c2:
+            c2.close()
+        shutil.rmtree(shared, ignore_errors=True)
 
     # ---- summary
     npass = sum(1 for _, ok, _ in results if ok)

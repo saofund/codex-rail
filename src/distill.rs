@@ -137,9 +137,13 @@ pub struct DistillPrep {
 /// Aggregate the archives into `distill_dir()/corpus/` and return a plan the
 /// launcher turns into a codex session. Regenerates the corpus every call.
 pub fn prepare() -> Result<DistillPrep> {
+    // This tree contains verbatim excerpts from private Codex/Claude history.
+    // Migrate artifacts created by older builds before reading or rewriting it.
+    state::ensure_private_distill_storage()?;
     let workdir = state::distill_dir();
     let corpus_dir = workdir.join("corpus");
     fs::create_dir_all(&corpus_dir).context("create distill corpus dir")?;
+    state::restrict_to_owner(&corpus_dir)?;
     // Clear any corpus from a previous run so stale chunks can't linger.
     if let Ok(entries) = fs::read_dir(&corpus_dir) {
         for e in entries.flatten() {
@@ -241,7 +245,7 @@ pub fn prepare() -> Result<DistillPrep> {
         let content = format!(
             "# corpus chunk {k}/{n} — the user's own conversations, in context (read this file fully)\n{body}\n<<CHUNK {k}/{n} id={marker}>>\n"
         );
-        fs::write(corpus_dir.join(&file), content)
+        state::write_private_file(&corpus_dir.join(&file), content)
             .with_context(|| format!("write corpus chunk {file}"))?;
         chunks.push(Chunk { file, marker });
     }

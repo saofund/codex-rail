@@ -57,7 +57,7 @@ fn main() -> Result<()> {
             // Also drop the exact prompt the UI would launch codex with, so a
             // headless/real-codex test can drive the same thing.
             let prompt_path = prep.workdir.join(".last-distill-prompt.txt");
-            let _ = std::fs::write(&prompt_path, distill::distill_prompt(&prep));
+            state::write_private_file(&prompt_path, distill::distill_prompt(&prep))?;
             println!(
                 "distill: {} sessions ({} codex + {} claude) · {} user turns · {} chunk(s) · scanned {} files, {} rich sessions available -> {}/corpus",
                 prep.sessions,

@@ -239,9 +239,15 @@ fn bucket_of(activity: &HashMap<String, Activity>, s: &SessionState) -> Bucket {
 // Has this distill session's output file been written yet?
 fn distill_done(s: &SessionState) -> bool {
     match s.distill_version {
-        Some(v) => state::distill_dir()
-            .join(format!("style-v{v:03}.md"))
-            .exists(),
+        Some(v) => {
+            let path = state::distill_dir().join(format!("style-v{v:03}.md"));
+            if !path.exists() {
+                return false;
+            }
+            // Codex creates the final profile with its own umask. Tighten it as
+            // soon as the manager observes completion.
+            state::restrict_private_file_to_owner(&path).is_ok()
+        }
         None => false,
     }
 }
@@ -648,6 +654,9 @@ struct DistillJob {
 
 impl App {
     fn load() -> Result<Self> {
+        // Migrate private corpus/style artifacts written by older builds before
+        // the manager starts doing any other work.
+        state::ensure_private_distill_storage()?;
         // Reap rail's own stale worker trees up front (orphaned/exited/duplicate),
         // so leftover codex don't pile up and lock codex's shared ~/.codex sqlite
         // state — the "database is locked" failure. See reap_orphan_workers.
@@ -1472,13 +1481,18 @@ fn run_slash(app: &mut App) -> Result<bool> {
 fn start_update(app: &mut App) {
     app.message = "checking for updates \u{2026}".to_string();
     let (tx, rx) = mpsc::channel();
+    let fake = env::var_os("CODEX_RAIL_FAKE_UPDATE").is_some();
     thread::spawn(move || {
-        let msg = match update::newer_available() {
-            Some(_) => match update::apply() {
-                Ok(tag) => format!("updated to {tag} — restart rail to run it"),
-                Err(e) => format!("update failed: {e:#}"),
-            },
-            None => "already up to date (or GitHub unreachable)".to_string(),
+        let msg = if fake {
+            "already up to date (test mode)".to_string()
+        } else {
+            match update::newer_available() {
+                Some(_) => match update::apply() {
+                    Ok(tag) => format!("updated to {tag} — restart rail to run it"),
+                    Err(e) => format!("update failed: {e:#}"),
+                },
+                None => "already up to date (or GitHub unreachable)".to_string(),
+            }
         };
         let _ = tx.send(msg);
     });
@@ -1818,31 +1832,58 @@ fn attach_current(app: &mut App, terminal: &mut TerminalSession) -> Result<()> {
 // exited. If the session has a captured codex_session_id, worker.rs will
 // pass it to `codex resume` instead of starting a brand-new conversation.
 fn relaunch_worker(session: &SessionState) -> Result<()> {
-    let mut session = session.clone();
-    session.status = STATUS_STARTING.to_string();
-    session.worker_pid = None;
-    session.child_pid = None;
-    session.exit_code = None;
-    session.last_error = None;
-    session.updated_at = state::now_secs();
-    state::write_state(&session)?;
+    state::validate_session_id(&session.id)?;
+    // Serialize bootstrap/remove across multiple manager processes. The guard is
+    // held until a worker is verifiably listening, so a second manager re-checks
+    // the winner's state instead of spawning another resume.
+    let _init_lock = state::acquire_session_init_lock(&session.id)?;
+    if let Some(current) = state::read_state_optional(&session.id)? {
+        if state::session_worker_is_running_under_init_lock(&current) {
+            return wait_for_worker(&session.id, &current.socket, None);
+        }
+    }
 
-    let mut child = Command::new(env::current_exe().context("current executable")?)
+    // Imported sessions have no rail state on disk yet; persist their resume
+    // identity once. Existing stopped sessions are deliberately left untouched:
+    // with two managers racing, either one rewriting state to "starting" could
+    // clobber the winning worker's fresh pid/status. The worker is the sole owner
+    // of runtime state and will transition it to running after taking its lock.
+    if state::read_state_optional(&session.id)?.is_none() {
+        let mut initial = session.clone();
+        initial.status = STATUS_STARTING.to_string();
+        initial.worker_pid = None;
+        initial.child_pid = None;
+        initial.exit_code = None;
+        initial.last_error = None;
+        initial.updated_at = state::now_secs();
+        state::write_state(&initial)?;
+        if state::read_label(&session.id).is_none() {
+            state::write_label(&session.id, &session.title, session.title_pinned)?;
+        }
+    }
+
+    let child = Command::new(env::current_exe().context("current executable")?)
         .arg("--worker")
         .arg(&session.id)
         .current_dir(Path::new(&session.cwd))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
-        .with_context(|| format!("spawn worker for {}", session.title))?;
+        .spawn();
+    let mut child = match child {
+        Ok(child) => child,
+        Err(err) => {
+            record_unclaimed_launch_failure(&session.id, &err.to_string());
+            return Err(err).with_context(|| format!("spawn worker for {}", session.title));
+        }
+    };
+    let spawned_pid = child.id();
 
     thread::spawn(move || {
         let _ = child.wait();
     });
 
-    wait_for_socket(&session.socket);
-    Ok(())
+    wait_for_worker(&session.id, &session.socket, Some(spawned_pid))
 }
 
 // Recover a codex rollout path for sessions whose worker never captured one —
@@ -2029,6 +2070,9 @@ fn adopt_codex_sessions(
         let Some((rcwd, sid)) = state::rollout_head(&path) else {
             continue;
         };
+        if state::validate_session_id(&sid).is_err() {
+            continue;
+        }
         let path_str = path.to_string_lossy().to_string();
         if exclude.contains(&sid) || exclude.contains(&path_str) || !seen.insert(sid.clone()) {
             continue;
@@ -2066,6 +2110,8 @@ fn adopt_codex_sessions(
             status: STATUS_EXITED.to_string(),
             worker_pid: None,
             child_pid: None,
+            worker_lock_protocol: false,
+            worker_token: None,
             socket: state::socket_path(&sid).to_string_lossy().to_string(),
             created_at: created,
             updated_at: mtime_secs.max(created),
@@ -2286,6 +2332,8 @@ fn create_session_in(
         status: STATUS_STARTING.to_string(),
         worker_pid: None,
         child_pid: None,
+        worker_lock_protocol: false,
+        worker_token: None,
         socket: socket.to_string_lossy().to_string(),
         created_at: now,
         updated_at: now,
@@ -2305,15 +2353,22 @@ fn create_session_in(
     // the worker's state.json writes never define it.
     state::write_label(&id, title, false)?;
 
-    let mut child = Command::new(env::current_exe().context("current executable")?)
+    let child = Command::new(env::current_exe().context("current executable")?)
         .arg("--worker")
         .arg(&id)
         .current_dir(Path::new(&session.cwd))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
-        .with_context(|| format!("spawn worker for {title}"))?;
+        .spawn();
+    let mut child = match child {
+        Ok(child) => child,
+        Err(err) => {
+            record_unclaimed_launch_failure(&id, &err.to_string());
+            return Err(err).with_context(|| format!("spawn worker for {title}"));
+        }
+    };
+    let spawned_pid = child.id();
 
     // The worker writes its own worker_pid/status once it has bound the
     // socket, so this is just for the value returned below; don't persist
@@ -2327,17 +2382,52 @@ fn create_session_in(
         let _ = child.wait();
     });
 
-    wait_for_socket(&session.socket);
+    wait_for_worker(&session.id, &session.socket, Some(spawned_pid))?;
     Ok(session)
 }
 
-fn wait_for_socket(socket: &str) {
+fn wait_for_worker(id: &str, socket: &str, expected_pid: Option<u32>) -> Result<()> {
     let path = Path::new(socket);
     for _ in 0..30 {
-        if path.exists() {
-            return;
+        match state::read_state(id) {
+            Ok(current) if current.status == STATUS_FAILED => {
+                anyhow::bail!(
+                    "worker failed: {}",
+                    current.last_error.as_deref().unwrap_or("unknown error")
+                );
+            }
+            Ok(current) if current.status == STATUS_RUNNING => {
+                let claimed = expected_pid
+                    .map(|pid| {
+                        current.worker_pid == Some(pid)
+                            || state::session_worker_is_running_under_init_lock(&current)
+                    })
+                    .unwrap_or(true);
+                if !claimed {
+                    std::thread::sleep(Duration::from_millis(80));
+                    continue;
+                }
+                // Existence alone can be a stale inode from a crashed worker. A
+                // successful connect proves the claimed worker is listening.
+                if UnixStream::connect(path).is_ok() {
+                    return Ok(());
+                }
+            }
+            _ => {}
         }
         std::thread::sleep(Duration::from_millis(80));
+    }
+    anyhow::bail!("worker did not open socket {}", path.display())
+}
+
+fn record_unclaimed_launch_failure(id: &str, message: &str) {
+    if let Ok(mut current) = state::read_state(id) {
+        if current.worker_pid.is_none() {
+            current.status = STATUS_FAILED.to_string();
+            current.last_error = Some(format!("spawn worker: {message}"));
+            current.updated_at = state::now_secs();
+            let _ = state::write_state(&current);
+        }
     }
 }
 
@@ -2353,7 +2443,7 @@ fn stop_with_confirmation(app: &mut App) -> Result<()> {
         return Ok(());
     };
 
-    let live = session.status == STATUS_STARTING || state::worker_is_running(session.worker_pid);
+    let live = state::session_worker_is_running(&session);
 
     let confirmed = app
         .stop_confirm
@@ -2383,6 +2473,8 @@ fn stop_with_confirmation(app: &mut App) -> Result<()> {
             .is_ok();
         if sent {
             app.message = "stop requested".to_string();
+        } else if state::request_worker_stop(&session.id).is_ok() {
+            app.message = "stop requested (socket gone — using worker control file)".to_string();
         } else if kill_session_pids(&session) {
             app.message = "stopped (socket gone — killed the worker)".to_string();
         } else {
@@ -2416,32 +2508,77 @@ fn stop_with_confirmation(app: &mut App) -> Result<()> {
     Ok(())
 }
 
-// Kill a session's worker AND its codex tree by the pids recorded in its own state
-// file — the fallback when the worker's socket is gone. Signals the whole process
-// GROUP of each pid (codex's launcher runs the real codex + sub-agents as
-// descendants; killing only the direct pid leaks them). SIGTERM only.
-fn kill_session_pids(session: &SessionState) -> bool {
-    let mut any = false;
-    unsafe {
-        let my = libc::getpgrp();
-        for pid in [session.child_pid, session.worker_pid].into_iter().flatten() {
-            if pid <= 1 {
-                continue;
-            }
-            let pgid = libc::getpgid(pid as libc::pid_t);
-            if pgid > 1 && pgid != my {
-                libc::kill(-pgid, libc::SIGTERM);
-            }
-            libc::kill(pid as libc::pid_t, libc::SIGTERM);
-            any = true;
-        }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProcRef {
+    pid: i32,
+    start_time: u64,
+}
+
+// /proc/<pid>/stat fields after the final `)` begin at field 3 (state). PPID is
+// field 4 and starttime is field 22. The starttime makes a pid snapshot immune
+// to pid reuse between discovery and signal.
+fn proc_identity(pid: i32) -> Option<(i32, u64)> {
+    if pid <= 1 {
+        return None;
     }
-    any
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rp = stat.rfind(')')?;
+    let fields: Vec<&str> = stat[rp + 1..].split_whitespace().collect();
+    let ppid = fields.get(1)?.parse().ok()?;
+    let start_time = fields.get(19)?.parse().ok()?;
+    Some((ppid, start_time))
+}
+
+fn proc_ref(pid: i32) -> Option<ProcRef> {
+    let (_, start_time) = proc_identity(pid)?;
+    Some(ProcRef { pid, start_time })
+}
+
+fn same_process(proc: ProcRef) -> bool {
+    proc_identity(proc.pid)
+        .map(|(_, start)| start == proc.start_time)
+        .unwrap_or(false)
+}
+
+fn proc_age_secs(proc: ProcRef) -> Option<u64> {
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if ticks <= 0 {
+        return None;
+    }
+    let uptime: f64 = std::fs::read_to_string("/proc/uptime")
+        .ok()?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    let started = proc.start_time as f64 / ticks as f64;
+    Some((uptime - started).max(0.0) as u64)
+}
+
+// Kill a session's worker AND its codex tree after a strong cmdline/data-dir
+// identity check. The start-time snapshot is rechecked immediately before every
+// signal so a recycled pid can never inherit the old session's SIGTERM.
+fn kill_session_pids(session: &SessionState) -> bool {
+    if !state::worker_matches_session(session.worker_pid, &session.id) {
+        return false;
+    }
+    let Some(worker_pid) = session.worker_pid.and_then(state::checked_pid) else {
+        return false;
+    };
+    let Some(worker) = proc_ref(worker_pid) else {
+        return false;
+    };
+    if !state::worker_matches_session(session.worker_pid, &session.id) || !same_process(worker) {
+        return false;
+    }
+    // Derive the codex descendants from the verified worker instead of trusting
+    // persisted child_pid/PGID values that may be stale or malformed.
+    kill_worker_tree(worker)
 }
 
 // Direct children of `pid`, read from /proc PPid. Used to find a worker's codex
 // launcher so its whole group can be killed.
-fn proc_children_of(pid: i32) -> Vec<i32> {
+fn proc_children_of(worker: ProcRef) -> Vec<ProcRef> {
     let mut kids = Vec::new();
     let Ok(rd) = std::fs::read_dir("/proc") else {
         return kids;
@@ -2454,15 +2591,12 @@ fn proc_children_of(pid: i32) -> Vec<i32> {
         else {
             continue;
         };
-        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{cpid}/stat")) {
-            // comm (2nd field, in parens) may contain spaces/parens — parse the
-            // fields after the last ')': state, then ppid.
-            if let Some(rp) = stat.rfind(')') {
-                let mut it = stat[rp + 1..].split_whitespace();
-                let _state = it.next();
-                if it.next().and_then(|s| s.parse::<i32>().ok()) == Some(pid) {
-                    kids.push(cpid);
-                }
+        if let Some((ppid, start_time)) = proc_identity(cpid) {
+            if ppid == worker.pid {
+                kids.push(ProcRef {
+                    pid: cpid,
+                    start_time,
+                });
             }
         }
     }
@@ -2472,20 +2606,36 @@ fn proc_children_of(pid: i32) -> Vec<i32> {
 // Kill a rail worker's whole codex tree, then the worker itself. codex's launcher
 // child runs the real codex (+ sub-agents) in its own process group, so -pgid on
 // that child takes the subtree; then SIGTERM the worker. SIGTERM only.
-fn kill_worker_tree(worker_pid: i32) {
+fn kill_worker_tree(worker: ProcRef) -> bool {
+    if !same_process(worker) {
+        return false;
+    }
+    let children = proc_children_of(worker);
     unsafe {
         let my = libc::getpgrp();
-        for child in proc_children_of(worker_pid) {
-            let pgid = libc::getpgid(child as libc::pid_t);
-            if pgid > 1 && pgid != my {
+        for child in children {
+            if proc_identity(child.pid) != Some((worker.pid, child.start_time)) {
+                continue;
+            }
+            let pgid = libc::getpgid(child.pid);
+            // Only broadcast to a group led by this exact child. Otherwise signal
+            // the verified child pid alone rather than risk an unrelated group.
+            if pgid == child.pid
+                && pgid != my
+                && proc_identity(child.pid) == Some((worker.pid, child.start_time))
+            {
                 libc::kill(-pgid, libc::SIGTERM);
             }
-            libc::kill(child as libc::pid_t, libc::SIGTERM);
+            if proc_identity(child.pid) == Some((worker.pid, child.start_time)) {
+                libc::kill(child.pid, libc::SIGTERM);
+            }
         }
-        if worker_pid > 1 {
-            libc::kill(worker_pid as libc::pid_t, libc::SIGTERM);
+        if same_process(worker) {
+            libc::kill(worker.pid, libc::SIGTERM);
+            return true;
         }
     }
+    false
 }
 
 // True only when the `rail --worker` at `pid` belongs to THIS manager's data dir,
@@ -2516,6 +2666,44 @@ fn worker_in_my_data_dir(pid: i32, my_data: &Path) -> bool {
     their_data == *my_data
 }
 
+fn worker_executable_matches_manager(pid: i32, manager_exe: &Path) -> bool {
+    let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) else {
+        return false;
+    };
+    let manager_name = manager_exe.file_name().and_then(|n| n.to_str());
+    let name_ok = exe
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| {
+            let n = n.strip_suffix(" (deleted)").unwrap_or(n);
+            Some(n) == manager_name || n.starts_with(".nfs")
+        })
+        .unwrap_or(false);
+    name_ok && exe.parent() == manager_exe.parent()
+}
+
+fn worker_candidate_still_matches(
+    proc: ProcRef,
+    id: &str,
+    my_data: &Path,
+    manager_exe: &Path,
+) -> bool {
+    if !same_process(proc)
+        || !worker_executable_matches_manager(proc.pid, manager_exe)
+        || !worker_in_my_data_dir(proc.pid, my_data)
+    {
+        return false;
+    }
+    let Ok(cmd) = std::fs::read(format!("/proc/{}/cmdline", proc.pid)) else {
+        return false;
+    };
+    let parts: Vec<&[u8]> = cmd
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .collect();
+    parts.len() == 3 && parts[1] == b"--worker" && parts[2] == id.as_bytes()
+}
+
 // Reap rail's OWN stale worker processes so leftover codex don't pile up and lock
 // codex's shared ~/.codex sqlite state (the "database is locked" failure). A worker
 // is stale when its session dir is gone (removed), its session already
@@ -2526,7 +2714,11 @@ fn worker_in_my_data_dir(pid: i32, my_data: &Path) -> bool {
 fn reap_orphan_workers() -> usize {
     let me = std::process::id() as i32;
     let my_data = state::data_dir();
-    let mut by_id: std::collections::HashMap<String, Vec<i32>> = std::collections::HashMap::new();
+    let Ok(manager_exe) = env::current_exe() else {
+        return 0;
+    };
+    let mut by_id: std::collections::HashMap<String, Vec<ProcRef>> =
+        std::collections::HashMap::new();
     let Ok(rd) = std::fs::read_dir("/proc") else {
         return 0;
     };
@@ -2549,9 +2741,14 @@ fn reap_orphan_workers() -> usize {
             .filter(|s| !s.is_empty())
             .map(|s| String::from_utf8_lossy(s).into_owned())
             .collect();
-        let is_worker = parts.first().map(|p| p.ends_with("rail")).unwrap_or(false)
-            && parts.iter().any(|p| p == "--worker");
-        if !is_worker {
+        // argv[0] may be NFS silly-renamed to `.nfs…` after a self-update, so its
+        // basename is not stable. Require rail's exact hidden-worker argv shape,
+        // the same executable directory, and the data-dir boundary. A random
+        // same-user process merely containing `--worker` must never be signalled.
+        if parts.len() != 3 || parts.get(1).map(String::as_str) != Some("--worker") {
+            continue;
+        }
+        if !worker_executable_matches_manager(pid, &manager_exe) {
             continue;
         }
         // SAFETY-CRITICAL: only ever consider workers that belong to THIS manager's
@@ -2562,27 +2759,90 @@ fn reap_orphan_workers() -> usize {
         if !worker_in_my_data_dir(pid, &my_data) {
             continue;
         }
-        if let Some(pos) = parts.iter().position(|p| p == "--worker") {
-            if let Some(id) = parts.get(pos + 1) {
-                by_id.entry(id.clone()).or_default().push(pid);
+        let Some(proc) = proc_ref(pid) else {
+            continue;
+        };
+        if let Some(id) = parts.get(2) {
+            if state::validate_session_id(id).is_ok() {
+                by_id.entry(id.clone()).or_default().push(proc);
             }
         }
     }
     let mut reaped = 0;
     for (id, pids) in by_id {
-        let st = state::read_state(&id).ok();
-        let exists = st.is_some();
+        // A relaunching manager holds init.lock from bootstrap through socket
+        // readiness. Never classify that in-between worker from the old exited
+        // state. Locks live in jobs/.locks (outside removable session dirs), so
+        // the inode remains stable through remove/relaunch races.
+        let _init_lock = match state::try_acquire_session_init_lock(&id) {
+            Ok(Some(lock)) => lock,
+            Ok(None) => continue,
+            Err(err) => {
+                eprintln!("skip stale-worker check for {id}: {err:#}");
+                continue;
+            }
+        };
+        // A current worker holds this for its whole lifetime. If busy, the
+        // process may be in the tiny claim window before state.json changes;
+        // never infer staleness from the previous exited snapshot. If acquired,
+        // keep it through classification+kill so no worker can start mid-check.
+        let _worker_lock = match state::try_acquire_worker_lock(&id) {
+            Ok(Some(lock)) => lock,
+            // A busy lifetime lock is stronger evidence of a live worker than a
+            // transient missing/stale NFS state file is evidence of an orphan.
+            // Fail closed and leave it alone; a later startup can retry.
+            Ok(None) => continue,
+            Err(err) => {
+                eprintln!("skip stale-worker check for {id}: {err:#}");
+                continue;
+            }
+        };
+        let st = match state::read_state_optional(&id) {
+            Ok(st) => st,
+            Err(err) => {
+                // Fail closed: a transient NFS/permission/JSON error is not proof
+                // that the worker is orphaned, so never turn uncertainty into kill.
+                eprintln!("skip stale-worker check for {id}: {err:#}");
+                continue;
+            }
+        };
+        let no_state = st.is_none();
         let exited = st
             .as_ref()
             .map(|s| matches!(s.status.as_str(), STATUS_EXITED | STATUS_FAILED))
             .unwrap_or(false);
-        let cur = st.as_ref().and_then(|s| s.worker_pid).map(|p| p as i32);
-        for pid in pids {
-            if exists && !exited && cur == Some(pid) {
+        let starting_timed_out = st
+            .as_ref()
+            .map(|s| {
+                s.status == STATUS_STARTING
+                    && s.worker_pid.is_none()
+                    && state::now_secs().saturating_sub(s.updated_at) > 15
+            })
+            .unwrap_or(false);
+        let cur = st.as_ref().and_then(|s| {
+            if state::worker_matches_session(s.worker_pid, &id) {
+                s.worker_pid.and_then(state::checked_pid)
+            } else {
+                None
+            }
+        });
+        for proc in pids {
+            if !exited && cur == Some(proc.pid) {
                 continue; // the live session's current worker — keep it
             }
-            kill_worker_tree(pid);
-            reaped += 1;
+            if proc_age_secs(proc).map(|age| age <= 15).unwrap_or(true) {
+                continue; // claim/relaunch grace; uncertainty is never stale proof
+            }
+            let proven_stale = no_state
+                || exited
+                || starting_timed_out
+                || cur.is_some_and(|owner| owner != proc.pid);
+            if proven_stale
+                && worker_candidate_still_matches(proc, &id, &my_data, &manager_exe)
+                && kill_worker_tree(proc)
+            {
+                reaped += 1;
+            }
         }
     }
     reaped

@@ -7,6 +7,7 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process;
@@ -19,39 +20,107 @@ const INITIAL_COLS: u16 = 80;
 const TAIL_BYTES: usize = 96 * 1024;
 
 pub fn run_worker(id: &str) -> Result<()> {
+    state::validate_session_id(id)?;
     unsafe {
         libc::setsid();
     }
 
+    state::ensure_base_dirs()?;
+    // Hold one kernel-backed lock for the worker's entire lifetime. Two manager
+    // processes can race to resume the same stopped/imported session; without
+    // this guard they would start two `codex resume` writers and the later worker
+    // would unlink the first worker's live socket.
+    let Some(_worker_lock) = state::try_acquire_worker_lock(id)? else {
+        // Another worker won the resume race. This is a normal idempotent
+        // outcome: do not mark the winning worker's session failed.
+        return Ok(());
+    };
+
     match run_worker_inner(id) {
         Ok(()) => Ok(()),
         Err(err) => {
-            mark_failed(id, &format!("{err:#}"));
+            mark_failed_if_owner(id, &format!("{err:#}"));
             Err(err)
         }
     }
 }
 
 fn run_worker_inner(id: &str) -> Result<()> {
-    state::ensure_base_dirs()?;
     let mut session = state::read_state(id)?;
+    let state_before_claim = session.clone();
     let socket_path = state::socket_path(id);
     if socket_path.exists() {
-        fs::remove_file(&socket_path).ok();
+        // Compatibility with workers started by an older rail build (which do
+        // not hold worker.lock): never unlink a socket that still has a listener.
+        match UnixStream::connect(&socket_path) {
+            Ok(_) => return Ok(()),
+            Err(err)
+                if matches!(
+                    err.raw_os_error(),
+                    Some(libc::ENOENT) | Some(libc::ECONNREFUSED) | Some(libc::ENOTSOCK)
+                ) => {}
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("probe existing socket {}", socket_path.display()))
+            }
+        }
     }
 
-    let listener = UnixListener::bind(&socket_path)
-        .with_context(|| format!("bind {}", socket_path.display()))?;
+    // No live legacy listener and we own worker.lock: claim runtime state now so
+    // every subsequent setup failure is attributable and can be persisted.
+    session.socket = socket_path.to_string_lossy().to_string();
+    session.worker_pid = Some(process::id());
+    session.child_pid = None;
+    session.worker_lock_protocol = true;
+    session.worker_token = Some(state::new_session_id());
+    session.status = crate::state::STATUS_STARTING.to_string();
+    session.exit_code = None;
+    session.last_error = None;
+    session.updated_at = state::now_secs();
+    persist_state(&session)?;
+
+    if socket_path.exists() {
+        let meta = fs::symlink_metadata(&socket_path)
+            .with_context(|| format!("inspect stale socket {}", socket_path.display()))?;
+        if !meta.file_type().is_socket() {
+            anyhow::bail!(
+                "refuse to remove non-socket at worker path {}",
+                socket_path.display()
+            );
+        }
+        fs::remove_file(&socket_path)
+            .with_context(|| format!("remove stale socket {}", socket_path.display()))?;
+    }
+
+    let listener = match UnixListener::bind(&socket_path) {
+        Ok(listener) => listener,
+        Err(err)
+            if err.raw_os_error() == Some(libc::EADDRINUSE)
+                && UnixStream::connect(&socket_path).is_ok() =>
+        {
+            // A legacy worker can bind in the narrow probe→bind window. Undo our
+            // provisional claim only if nobody else has already overwritten it,
+            // then treat that legacy listener as the idempotent winner.
+            if state::read_state(id)
+                .ok()
+                .and_then(|s| s.worker_pid)
+                == Some(process::id())
+            {
+                state::write_state(&state_before_claim).ok();
+            }
+            return Ok(());
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("bind {}", socket_path.display()))
+        }
+    };
     state::restrict_file_to_owner(&socket_path)?;
+    let socket_identity = fs::symlink_metadata(&socket_path)
+        .map(|m| (m.dev(), m.ino()))
+        .with_context(|| format!("identify socket {}", socket_path.display()))?;
     listener
         .set_nonblocking(true)
         .context("set listener nonblocking")?;
-
-    session.socket = socket_path.to_string_lossy().to_string();
-    session.worker_pid = Some(process::id());
-    session.status = STATUS_RUNNING.to_string();
-    session.updated_at = state::now_secs();
-    persist_state(&session)?;
 
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -115,6 +184,7 @@ fn run_worker_inner(id: &str) -> Result<()> {
     drop(pair.slave);
 
     session.child_pid = child_pid;
+    session.status = STATUS_RUNNING.to_string();
     session.updated_at = state::now_secs();
     persist_state(&session)?;
 
@@ -193,7 +263,7 @@ fn run_worker_inner(id: &str) -> Result<()> {
                 session.status = STATUS_EXITED.to_string();
                 session.updated_at = state::now_secs();
                 persist_state(&session).ok();
-                fs::remove_file(&session.socket).ok();
+                remove_socket_if_same(Path::new(&session.socket), socket_identity);
                 return Ok(());
             }
             Ok(WorkerEvent::ClientInput(client_id, bytes)) => {
@@ -220,16 +290,16 @@ fn run_worker_inner(id: &str) -> Result<()> {
                 }
             }
             Ok(WorkerEvent::Stop) => {
-                if stop_requested_at.is_none() {
-                    session.status = STATUS_STOPPING.to_string();
-                    session.updated_at = state::now_secs();
-                    persist_state(&session).ok();
-                    signal_child(child_pid, libc::SIGTERM);
-                    stop_requested_at = Some(Instant::now());
-                }
+                begin_stop(&mut session, child_pid, &mut stop_requested_at);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+
+        if stop_requested_at.is_none()
+            && state::take_worker_stop_request(&session).unwrap_or(false)
+        {
+            begin_stop(&mut session, child_pid, &mut stop_requested_at);
         }
 
         if let Some(started) = stop_requested_at {
@@ -241,6 +311,30 @@ fn run_worker_inner(id: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn begin_stop(
+    session: &mut SessionState,
+    child_pid: Option<u32>,
+    stop_requested_at: &mut Option<Instant>,
+) {
+    if stop_requested_at.is_some() {
+        return;
+    }
+    session.status = STATUS_STOPPING.to_string();
+    session.updated_at = state::now_secs();
+    persist_state(session).ok();
+    signal_child(child_pid, libc::SIGTERM);
+    *stop_requested_at = Some(Instant::now());
+}
+
+fn remove_socket_if_same(path: &Path, expected: (u64, u64)) {
+    let same = fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_socket() && (m.dev(), m.ino()) == expected)
+        .unwrap_or(false);
+    if same {
+        fs::remove_file(path).ok();
+    }
 }
 
 fn accept_connections(
@@ -412,7 +506,7 @@ fn is_current_client(attached: &Option<(u64, UnixStream)>, client_id: u64) -> bo
 }
 
 fn signal_child(pid: Option<u32>, signal: libc::c_int) {
-    if let Some(pid) = pid {
+    if let Some(pid) = pid.and_then(state::checked_pid) {
         unsafe {
             // Signal the child's whole process GROUP, not just the pid. codex's npm
             // launcher runs the real codex binary as a grandchild (and codex spawns
@@ -420,11 +514,11 @@ fn signal_child(pid: Option<u32>, signal: libc::c_int) {
             // codex accumulate and lock codex's shared ~/.codex sqlite state. The PTY
             // gave the child its own session/group, so -pgid can't hit us — but guard
             // against ever signalling our own group just in case.
-            let pgid = libc::getpgid(pid as libc::pid_t);
+            let pgid = libc::getpgid(pid);
             if pgid > 1 && pgid != libc::getpgrp() {
                 libc::kill(-pgid, signal);
             }
-            libc::kill(pid as libc::pid_t, signal);
+            libc::kill(pid, signal);
         }
     }
 }
@@ -547,13 +641,18 @@ fn persist_state(session: &SessionState) -> Result<()> {
     state::write_state(session)
 }
 
-fn mark_failed(id: &str, message: &str) {
+fn mark_failed_if_owner(id: &str, message: &str) {
     if let Ok(mut session) = state::read_state(id) {
+        if session.worker_pid != Some(process::id()) {
+            return;
+        }
         session.status = STATUS_FAILED.to_string();
         session.last_error = Some(message.to_string());
         session.updated_at = state::now_secs();
         state::write_state(&session).ok();
-        fs::remove_file(&session.socket).ok();
+        // Do not unlink here: after an EADDRINUSE race the pathname may belong
+        // to a legacy live worker. A refused stale socket is safely removed by
+        // the next owner during its probe phase.
     }
 }
 

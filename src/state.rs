@@ -1,9 +1,11 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
-use std::io::BufRead;
-use std::os::unix::fs::PermissionsExt;
+use std::io::{self, BufRead, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,6 +19,8 @@ pub const STATUS_EXITED: &str = "exited";
 pub const STATUS_FAILED: &str = "failed";
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+const STARTING_GRACE_SECS: u64 = 15;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionState {
@@ -27,6 +31,15 @@ pub struct SessionState {
     pub status: String,
     pub worker_pid: Option<u32>,
     pub child_pid: Option<u32>,
+    // New workers hold jobs/.locks/<id>.worker.lock for their whole lifetime.
+    // False means a legacy state from before that protocol existed.
+    #[serde(default)]
+    pub worker_lock_protocol: bool,
+    // A per-worker generation token. It scopes out-of-band control files to the
+    // exact lock owner, so a stale stop request cannot hit a later worker after
+    // pid reuse or a session resume.
+    #[serde(default)]
+    pub worker_token: Option<String>,
     pub socket: String,
     pub created_at: u64,
     pub updated_at: u64,
@@ -88,6 +101,18 @@ pub fn new_session_id() -> String {
     format!("{:x}-{:x}-{:x}", now_millis(), process::id(), n)
 }
 
+pub fn validate_session_id(id: &str) -> Result<()> {
+    if id.is_empty()
+        || id.len() > 64
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        bail!("invalid session id");
+    }
+    Ok(())
+}
+
 pub fn data_dir() -> PathBuf {
     if let Some(path) = env::var_os("XDG_DATA_HOME") {
         return PathBuf::from(path).join(APP_DIR);
@@ -144,12 +169,195 @@ pub fn socket_path(id: &str) -> PathBuf {
     runtime_dir().join(format!("{id}.sock"))
 }
 
+fn worker_stop_request_path(id: &str, token: &str) -> Result<PathBuf> {
+    validate_session_id(id)?;
+    validate_session_id(token)?;
+    Ok(job_dir(id).join(format!(".stop-{token}.request")))
+}
+
 pub fn ensure_base_dirs() -> Result<()> {
     fs::create_dir_all(jobs_dir()).context("create jobs directory")?;
     restrict_to_owner(&jobs_dir())?;
     fs::create_dir_all(runtime_dir()).context("create runtime directory")?;
     restrict_to_owner(&runtime_dir())?;
     Ok(())
+}
+
+/// Create the private distillation storage and tighten any files left behind by
+/// older rail builds.  The corpus and style profiles contain excerpts from the
+/// user's Codex/Claude history, so relying on the process umask (commonly 022)
+/// would leave them readable by other users on a shared host.
+pub fn ensure_private_distill_storage() -> Result<()> {
+    let config = config_dir();
+    secure_private_dir(&config)?;
+    secure_private_dir(&distill_dir())
+}
+
+fn secure_private_dir(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            bail!("refuse symlinked private directory {}", path.display())
+        }
+        Ok(meta) if !meta.is_dir() => bail!("private path is not a directory: {}", path.display()),
+        Ok(_) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(path).with_context(|| format!("create {}", path.display()))?;
+            let meta = fs::symlink_metadata(path)
+                .with_context(|| format!("inspect {}", path.display()))?;
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                bail!("private path is not a real directory: {}", path.display());
+            }
+        }
+        Err(err) => return Err(err).with_context(|| format!("inspect {}", path.display())),
+    }
+    restrict_to_owner(path)?;
+    for entry in fs::read_dir(path).with_context(|| format!("read {}", path.display()))? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let child = entry.path();
+        if kind.is_dir() {
+            secure_private_dir(&child)?;
+        } else if kind.is_file() {
+            restrict_file_to_owner(&child)?;
+        }
+        // Never follow symlinks while migrating an existing tree: a link may
+        // intentionally point outside rail's private storage.
+    }
+    Ok(())
+}
+
+/// Write a sensitive file with 0600 from the instant it is created. Existing
+/// files are chmodded before truncation by `ensure_private_distill_storage`, and
+/// again here for callers writing an individual artifact.
+pub fn write_private_file(path: &Path, bytes: impl AsRef<[u8]>) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        restrict_to_owner(parent)?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    if !file.metadata()?.is_file() {
+        bail!("private output is not a regular file: {}", path.display());
+    }
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    file.write_all(bytes.as_ref())
+        .with_context(|| format!("write {}", path.display()))
+}
+
+pub fn restrict_private_file_to_owner(path: &Path) -> Result<()> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("open private file {}", path.display()))?;
+    if !file.metadata()?.is_file() {
+        bail!("private path is not a regular file: {}", path.display());
+    }
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("restrict permissions on {}", path.display()))
+}
+
+fn open_session_lock(id: &str, name: &str, nonblocking: bool) -> Result<Option<fs::File>> {
+    validate_session_id(id)?;
+    // Locks live outside the removable job directory. `flock` protects an inode,
+    // not a pathname: unlinking job_dir/worker.lock while it was held would let a
+    // second process create a new inode with the same name and split the lock.
+    let dir = jobs_dir().join(".locks");
+    fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    restrict_to_owner(&dir)?;
+    let path = dir.join(format!("{id}.{name}"));
+    open_lock_path(&path, nonblocking)
+}
+
+fn open_lock_path(path: &Path, nonblocking: bool) -> Result<Option<fs::File>> {
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(&path)
+        .with_context(|| format!("open {}", path.display()))?;
+    restrict_file_to_owner(&path)?;
+    let flags = libc::LOCK_EX | if nonblocking { libc::LOCK_NB } else { 0 };
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), flags) } == 0 {
+            return Ok(Some(file));
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::Interrupted && !nonblocking {
+            continue;
+        }
+        let raw = err.raw_os_error();
+        if nonblocking && (raw == Some(libc::EWOULDBLOCK) || raw == Some(libc::EAGAIN)) {
+            return Ok(None);
+        }
+        return Err(err).with_context(|| format!("lock {}", path.display()));
+    }
+}
+
+/// Serialize manager-side bootstrap/removal for one session. The returned file
+/// must stay alive for the whole critical section.
+pub fn acquire_session_init_lock(id: &str) -> Result<fs::File> {
+    open_session_lock(id, "init.lock", false)?.context("blocking lock returned no guard")
+}
+
+pub fn try_acquire_session_init_lock(id: &str) -> Result<Option<fs::File>> {
+    open_session_lock(id, "init.lock", true)
+}
+
+/// Try to become the sole worker for a session. `Ok(None)` means another worker
+/// owns the lifetime lock and must be left completely untouched.
+pub fn try_acquire_worker_lock(id: &str) -> Result<Option<fs::File>> {
+    open_session_lock(id, "worker.lock", true)
+}
+
+/// Ask a lock-aware worker to stop without relying on its Unix socket or pid.
+/// This is the portable fallback when a runtime directory has been cleared:
+/// the lifetime lock proves that this session still has a worker, while the
+/// generation-scoped marker prevents a late request from reaching a successor.
+pub fn request_worker_stop(id: &str) -> Result<()> {
+    validate_session_id(id)?;
+    let _init_lock = acquire_session_init_lock(id)?;
+    let current = read_state(id)?;
+    if !current.worker_lock_protocol {
+        bail!("worker does not support out-of-band stop requests");
+    }
+    let token = current
+        .worker_token
+        .as_deref()
+        .context("worker state has no generation token")?;
+    if try_acquire_worker_lock(id)?.is_some() {
+        bail!("session no longer has a live worker");
+    }
+    write_private_file(&worker_stop_request_path(id, token)?, b"stop\n")
+}
+
+/// Consume only the marker for this exact worker generation. A marker left by
+/// a crashed predecessor has a different filename and is therefore inert.
+pub fn take_worker_stop_request(state: &SessionState) -> Result<bool> {
+    if !state.worker_lock_protocol {
+        return Ok(false);
+    }
+    let Some(token) = state.worker_token.as_deref() else {
+        return Ok(false);
+    };
+    let path = worker_stop_request_path(&state.id, token)?;
+    let meta = match fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err).with_context(|| format!("inspect {}", path.display())),
+    };
+    if !meta.is_file() {
+        bail!("worker stop request is not a regular file: {}", path.display());
+    }
+    fs::remove_file(&path).with_context(|| format!("consume {}", path.display()))?;
+    Ok(true)
 }
 
 // Session state and worker sockets can contain full terminal transcripts
@@ -167,17 +375,32 @@ pub fn restrict_file_to_owner(path: &Path) -> Result<()> {
 }
 
 pub fn read_state(id: &str) -> Result<SessionState> {
+    validate_session_id(id)?;
     let path = state_path(id);
     let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
     serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))
 }
 
+pub fn read_state_optional(id: &str) -> Result<Option<SessionState>> {
+    validate_session_id(id)?;
+    let path = state_path(id);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
+    };
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse {}", path.display()))
+        .map(Some)
+}
+
 pub fn write_state(state: &SessionState) -> Result<()> {
+    validate_session_id(&state.id)?;
     let dir = job_dir(&state.id);
     fs::create_dir_all(&dir).context("create job directory")?;
     restrict_to_owner(&dir)?;
     let path = state_path(&state.id);
-    let tmp = path.with_extension("json.tmp");
+    let tmp = unique_tmp_path(&dir, "state.json");
     let bytes = serde_json::to_vec_pretty(state).context("serialize state")?;
     fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
     restrict_file_to_owner(&tmp)?;
@@ -208,11 +431,12 @@ pub fn read_label(id: &str) -> Option<(String, bool)> {
 }
 
 pub fn write_label(id: &str, title: &str, title_pinned: bool) -> Result<()> {
+    validate_session_id(id)?;
     let dir = job_dir(id);
     fs::create_dir_all(&dir).context("create job directory")?;
     restrict_to_owner(&dir)?;
     let path = label_path(id);
-    let tmp = path.with_extension("json.tmp");
+    let tmp = unique_tmp_path(&dir, "label.json");
     let label = Label {
         title: title.to_string(),
         title_pinned,
@@ -224,6 +448,11 @@ pub fn write_label(id: &str, title: &str, title_pinned: bool) -> Result<()> {
     Ok(())
 }
 
+fn unique_tmp_path(dir: &Path, stem: &str) -> PathBuf {
+    let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    dir.join(format!(".{stem}.tmp-{}-{n}", process::id()))
+}
+
 pub fn load_sessions() -> Result<Vec<SessionState>> {
     let mut sessions = Vec::new();
     let dir = jobs_dir();
@@ -233,6 +462,7 @@ pub fn load_sessions() -> Result<Vec<SessionState>> {
 
     for entry in fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
         let entry = entry?;
+        let dir_id = entry.file_name().to_string_lossy().to_string();
         let path = entry.path().join("state.json");
         if !path.exists() {
             continue;
@@ -244,6 +474,10 @@ pub fn load_sessions() -> Result<Vec<SessionState>> {
                     .with_context(|| format!("parse {}", path.display()))
             }) {
             Ok(mut state) => {
+                if validate_session_id(&state.id).is_err() || state.id != dir_id {
+                    eprintln!("skip session state whose id does not match its directory: {dir_id}");
+                    continue;
+                }
                 reconcile_liveness(&mut state);
                 // label.json (manager-owned) wins over state.json's title, so a
                 // worker's periodic state writes can never revert a rename.
@@ -278,30 +512,100 @@ fn reconcile_liveness(state: &mut SessionState) {
     if !watched {
         return;
     }
-    let Some(pid) = state.worker_pid else {
+    if state.worker_pid.is_none() {
+        if state.status == STATUS_STARTING
+            && now_secs().saturating_sub(state.updated_at) > STARTING_GRACE_SECS
+        {
+            state.status = STATUS_EXITED.to_string();
+            state.last_error = Some("worker never claimed this session".to_string());
+        }
         return;
-    };
-    if worker_alive(pid) {
+    }
+    if session_worker_is_running(state) {
         return;
     }
 
     state.status = STATUS_EXITED.to_string();
-    state.last_error = Some("worker process not found".to_string());
-    state.updated_at = now_secs();
-    write_state(state).ok();
+    state.last_error = Some("worker process not found or no longer owns this session".to_string());
+    // This is derived manager state only. Runtime state.json is worker-owned;
+    // persisting this stale snapshot could clobber a newly-started worker's pid.
 }
 
-fn worker_alive(pid: u32) -> bool {
+pub fn checked_pid(pid: u32) -> Option<libc::pid_t> {
+    let pid = libc::pid_t::try_from(pid).ok()?;
+    (pid > 1).then_some(pid)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkerIdentity {
+    Match,
+    Gone,
+    Mismatch,
+    Unknown,
+}
+
+fn worker_identity(pid: u32, id: &str) -> WorkerIdentity {
+    let Some(raw_pid) = checked_pid(pid) else {
+        return WorkerIdentity::Mismatch;
+    };
     // kill(pid, 0) also succeeds for a zombie — a process that has already
     // exited but hasn't been reaped by its parent. On systems whose init
     // doesn't reap orphans (e.g. a bare container PID 1), a crashed worker
     // lingers as <defunct> indefinitely; treating it as alive would pin its
     // session to "running" forever and make it unstoppable (its socket is
     // gone, so STOP can't connect). So reject processes in the zombie state.
-    if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
-        return false;
+    if unsafe { libc::kill(raw_pid, 0) } != 0 {
+        return match io::Error::last_os_error().raw_os_error() {
+            Some(libc::ESRCH) => WorkerIdentity::Gone,
+            _ => WorkerIdentity::Unknown,
+        };
     }
-    !proc_is_zombie(pid)
+    if proc_is_zombie(pid) {
+        return WorkerIdentity::Gone;
+    }
+    if !Path::new("/proc").is_dir() {
+        return WorkerIdentity::Unknown;
+    }
+    let cmdline = match fs::read(format!("/proc/{pid}/cmdline")) {
+        Ok(cmdline) => cmdline,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return WorkerIdentity::Gone,
+        // macOS and restricted /proc: keep the row live, but never use this
+        // unverified identity for the PID-kill fallback.
+        Err(_) => return WorkerIdentity::Unknown,
+    };
+    let parts: Vec<&[u8]> = cmdline
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .collect();
+    for pair in parts.windows(2) {
+        if pair[0] == b"--worker" && pair[1] == id.as_bytes() {
+            return match proc_data_dir(pid) {
+                Some(dir) if dir == data_dir() => WorkerIdentity::Match,
+                Some(_) => WorkerIdentity::Mismatch,
+                None => WorkerIdentity::Unknown,
+            };
+        }
+    }
+    WorkerIdentity::Mismatch
+}
+
+fn proc_data_dir(pid: u32) -> Option<PathBuf> {
+    let environ = fs::read(format!("/proc/{pid}/environ")).ok()?;
+    let mut xdg: Option<String> = None;
+    let mut home: Option<String> = None;
+    for kv in environ.split(|b| *b == 0) {
+        if let Some(rest) = kv.strip_prefix(b"XDG_DATA_HOME=") {
+            xdg = Some(String::from_utf8_lossy(rest).into_owned());
+        } else if let Some(rest) = kv.strip_prefix(b"HOME=") {
+            home = Some(String::from_utf8_lossy(rest).into_owned());
+        }
+    }
+    match xdg.filter(|x| !x.is_empty()) {
+        Some(x) => Some(PathBuf::from(x).join(APP_DIR)),
+        None => home
+            .filter(|h| !h.is_empty())
+            .map(|h| PathBuf::from(h).join(".local/share").join(APP_DIR)),
+    }
 }
 
 fn proc_is_zombie(pid: u32) -> bool {
@@ -317,16 +621,75 @@ fn proc_is_zombie(pid: u32) -> bool {
     }
 }
 
-/// Whether a worker with this pid is a genuinely live process (not absent, not
-/// a zombie). Used by the manager to decide stop-vs-remove for a session.
-pub fn worker_is_running(pid: Option<u32>) -> bool {
-    pid.map(worker_alive).unwrap_or(false)
+/// Cross-platform liveness: current workers prove life by holding worker.lock.
+/// During migration, an older worker can instead prove life with a matching
+/// Linux cmdline/data-dir identity or a connectable canonical socket.
+pub fn session_worker_is_running(state: &SessionState) -> bool {
+    if state.status == STATUS_STARTING
+        && state.worker_pid.is_none()
+        && now_secs().saturating_sub(state.updated_at) <= STARTING_GRACE_SECS
+    {
+        return true;
+    }
+    let _init_lock = match try_acquire_session_init_lock(&state.id) {
+        Ok(Some(lock)) => lock,
+        Ok(None) | Err(_) => return true,
+    };
+    session_worker_is_running_under_init_lock(state)
+}
+
+/// Same liveness check when the caller already owns init.lock. Acquiring the
+/// same flock through a second open fd would conflict with our own guard.
+pub fn session_worker_is_running_under_init_lock(state: &SessionState) -> bool {
+    let _worker_lock = match try_acquire_worker_lock(&state.id) {
+        Ok(Some(lock)) => lock,
+        Ok(None) | Err(_) => return true,
+    };
+    legacy_worker_is_running(state)
+}
+
+fn legacy_worker_is_running(state: &SessionState) -> bool {
+    // The caller already acquired worker.lock. For a state written by the new
+    // protocol that alone proves its worker is gone, even on macOS/no-/proc where
+    // a recycled pid would otherwise look "unknown but alive" forever.
+    if state.worker_lock_protocol {
+        // A connectable socket is still stronger live evidence if the underlying
+        // filesystem's flock service is broken or an old/new binary overlaps.
+        return UnixStream::connect(&state.socket).is_ok();
+    }
+    let identity = state
+        .worker_pid
+        .map(|pid| worker_identity(pid, &state.id));
+    identity == Some(WorkerIdentity::Match)
+        || (identity == Some(WorkerIdentity::Unknown)
+            && matches!(
+                state.status.as_str(),
+                STATUS_STARTING | STATUS_RUNNING | STATUS_STOPPING
+            ))
+        || UnixStream::connect(&state.socket).is_ok()
+}
+
+/// Strong identity check used before any PID-based signal. Unknown is false:
+/// being unable to prove ownership is a reason not to kill.
+pub fn worker_matches_session(pid: Option<u32>, id: &str) -> bool {
+    pid.map(|pid| worker_identity(pid, id) == WorkerIdentity::Match)
+        .unwrap_or(false)
 }
 
 /// Delete a stopped session's on-disk footprint so it leaves the manager list.
 /// The caller must ensure the worker is not running — removing a live
 /// session's dir would pull the ground out from under its worker.
 pub fn remove_session(id: &str) -> Result<()> {
+    validate_session_id(id)?;
+    let _init_lock = acquire_session_init_lock(id)?;
+    let Some(_worker_lock) = try_acquire_worker_lock(id)? else {
+        bail!("session still has a live worker");
+    };
+    if let Some(current) = read_state_optional(id)? {
+        if legacy_worker_is_running(&current) {
+            bail!("session state still belongs to a live worker");
+        }
+    }
     // Best-effort socket cleanup; a cleanly-exited worker already removed it.
     fs::remove_file(socket_path(id)).ok();
     let dir = job_dir(id);
@@ -564,7 +927,13 @@ fn walk_rollouts(dir: &Path, depth: u32, out: &mut Vec<PathBuf>) {
 
 #[cfg(test)]
 mod tests {
-    use super::is_synthetic_marker;
+    use super::{
+        checked_pid, is_synthetic_marker, open_lock_path, secure_private_dir,
+        validate_session_id, write_private_file,
+    };
+    use std::fs;
+    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn synthetic_markers_are_skipped() {
@@ -588,5 +957,90 @@ mod tests {
         assert!(!is_synthetic_marker("<html> is a lowercase tag, real prose"));
         assert!(!is_synthetic_marker("use the [brackets] like this in a sentence"));
         assert!(!is_synthetic_marker(""));
+    }
+
+    #[test]
+    fn private_tree_migration_locks_down_existing_and_new_artifacts() {
+        let root = std::env::temp_dir().join(format!(
+            "rail-private-tree-{}-{}",
+            std::process::id(),
+            super::now_millis()
+        ));
+        let nested = root.join("corpus");
+        fs::create_dir_all(&nested).unwrap();
+        let old = nested.join("corpus-01.md");
+        fs::write(&old, "private history").unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&old, fs::Permissions::from_mode(0o644)).unwrap();
+
+        secure_private_dir(&root).unwrap();
+        assert_eq!(fs::metadata(&root).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(
+            fs::metadata(&nested).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(fs::metadata(&old).unwrap().permissions().mode() & 0o777, 0o600);
+
+        let new = nested.join("style-v001.md");
+        write_private_file(&new, "profile").unwrap();
+        assert_eq!(fs::metadata(&new).unwrap().permissions().mode() & 0o777, 0o600);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn worker_lock_is_exclusive_and_released_with_its_guard() {
+        let root = std::env::temp_dir().join(format!(
+            "rail-worker-lock-{}-{}",
+            std::process::id(),
+            super::now_millis()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("worker.lock");
+        let first = open_lock_path(&path, true).unwrap().unwrap();
+        assert!(open_lock_path(&path, true).unwrap().is_none());
+        drop(first);
+        assert!(open_lock_path(&path, true).unwrap().is_some());
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn session_ids_and_pids_fail_closed() {
+        for id in ["abc-123", "seed_0", "A1"] {
+            assert!(validate_session_id(id).is_ok());
+        }
+        for id in ["", "../escape", "a/b", ".", "has space"] {
+            assert!(validate_session_id(id).is_err(), "accepted {id:?}");
+        }
+        assert!(checked_pid(0).is_none());
+        assert!(checked_pid(1).is_none());
+        assert!(checked_pid(u32::MAX).is_none());
+    }
+
+    #[test]
+    fn private_storage_never_follows_symlinks() {
+        let root = std::env::temp_dir().join(format!(
+            "rail-private-symlink-{}-{}",
+            std::process::id(),
+            super::now_millis()
+        ));
+        let outside = root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let target = outside.join("target.txt");
+        fs::write(&target, "keep me").unwrap();
+
+        let linked_dir = root.join("distill-link");
+        symlink(&outside, &linked_dir).unwrap();
+        assert!(secure_private_dir(&linked_dir).is_err());
+
+        let output_link = root.join("prompt-link");
+        symlink(&target, &output_link).unwrap();
+        assert!(write_private_file(&output_link, "overwrite").is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep me");
+        let _ = fs::remove_dir_all(&root);
     }
 }

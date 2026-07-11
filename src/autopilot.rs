@@ -100,11 +100,8 @@ pub fn load(main_id: &str) -> Option<AutopilotState> {
 
 pub fn save(main_id: &str, st: &AutopilotState) {
     let p = path(main_id);
-    if let Some(dir) = p.parent() {
-        let _ = fs::create_dir_all(dir);
-    }
     if let Ok(bytes) = serde_json::to_vec_pretty(st) {
-        let _ = fs::write(&p, bytes);
+        let _ = state::write_private_file(&p, bytes);
     }
 }
 
