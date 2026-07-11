@@ -6,3 +6,6 @@ __pycache__/
 # Local test renders — several capture real session content; keep out of the
 # public repo. Add curated, fake-session demos explicitly if ever wanted.
 tests/screenshots/
+
+# Developer handoff doc — contains a live GitHub token in plaintext. NEVER commit.
+HANDOFF.md
