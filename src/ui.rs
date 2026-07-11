@@ -1933,25 +1933,45 @@ fn resolve_missing_rollouts(
 // clobber a rollout id the worker is about to capture.
 fn sync_titles_from_history(sessions: &mut [SessionState]) {
     let firsts = state::codex_first_messages();
-    if firsts.is_empty() {
-        return;
-    }
     for s in sessions.iter_mut() {
         if s.title_pinned {
             continue;
         }
-        let Some(sid) = s.codex_session_id.as_ref() else {
-            continue;
-        };
-        let Some(msg) = firsts.get(sid) else {
-            continue;
-        };
-        let title = title_from_message(msg);
-        if !title.is_empty() && title != s.title {
-            s.title = title.clone();
-            // Sync is unpinned by definition; write the manager-owned label so
-            // this never contends with the worker's state.json writes.
-            state::write_label(&s.id, &title, false).ok();
+        // Prefer codex's own first message from history.jsonl (marker-filtered).
+        let from_history = s
+            .codex_session_id
+            .as_ref()
+            .and_then(|sid| firsts.get(sid))
+            .map(|m| title_from_message(m))
+            .filter(|t| !t.is_empty());
+        // If there's nothing in history AND the current title is a junk marker —
+        // an old adopted/persisted title like "<command-name>/effort" living in
+        // state.json — recover the real first line from the rollout, else fall
+        // back to a neutral "codex <id>". Without this, such a title survives
+        // forever (sync only ran when history had the id, and these old ids don't).
+        let new_title = from_history.or_else(|| {
+            if !state::is_synthetic_marker(&s.title) {
+                return None;
+            }
+            s.codex_rollout_path
+                .as_ref()
+                .and_then(|p| state::rollout_first_user_message(Path::new(p)))
+                .map(|m| title_from_message(&m))
+                .filter(|t| !t.is_empty())
+                .or_else(|| {
+                    s.codex_session_id
+                        .as_ref()
+                        .map(|sid| format!("codex {}", sid.chars().take(8).collect::<String>()))
+                })
+        });
+        if let Some(title) = new_title {
+            if title != s.title {
+                s.title = title.clone();
+                // Sync is unpinned by definition; write the manager-owned label so
+                // this never contends with the worker's state.json writes (and it
+                // wins over the junk state.json title going forward).
+                state::write_label(&s.id, &title, false).ok();
+            }
         }
     }
 }
@@ -2343,20 +2363,22 @@ fn stop_with_confirmation(app: &mut App) -> Result<()> {
 
     app.stop_confirm = None;
     if live {
-        match UnixStream::connect(&session.socket) {
-            Ok(mut stream) => match stream.write_all(b"STOP\n").and_then(|_| stream.flush()) {
-                Ok(()) => {
-                    app.message = "stop requested".to_string();
-                    app.reload()?;
-                }
-                Err(err) => {
-                    app.message = format!("stop failed: {err}");
-                }
-            },
-            Err(err) => {
-                app.message = format!("stop failed: {err}");
-            }
+        // Ask the worker to shut down cleanly over its socket. If the socket is
+        // gone (e.g. $XDG_RUNTIME_DIR was cleared while the worker stayed alive —
+        // connect fails with a file error and there's nothing to STOP), fall back
+        // to killing the worker by its recorded pid so the row can still be
+        // stopped instead of being wedged "running" forever.
+        let sent = UnixStream::connect(&session.socket)
+            .and_then(|mut s| s.write_all(b"STOP\n").and_then(|_| s.flush()))
+            .is_ok();
+        if sent {
+            app.message = "stop requested".to_string();
+        } else if kill_session_pids(&session) {
+            app.message = "stopped (socket gone — killed the worker)".to_string();
+        } else {
+            app.message = "stop failed: worker unreachable and no pid to kill".to_string();
         }
+        app.reload()?;
     } else if session.adopted {
         // An imported codex row has no on-disk footprint to delete — "removing" it
         // dismisses it so the rescan stops re-importing it. The codex transcript is
@@ -2382,6 +2404,23 @@ fn stop_with_confirmation(app: &mut App) -> Result<()> {
         }
     }
     Ok(())
+}
+
+// Kill a session's worker (and its codex child) by the pids recorded in its own
+// state file — the fallback when the worker's socket is gone. SIGTERM lets the
+// worker reap its child and clean up; the row flips to Stopped on the next reload.
+fn kill_session_pids(session: &SessionState) -> bool {
+    let mut any = false;
+    for pid in [session.child_pid, session.worker_pid].into_iter().flatten() {
+        if pid > 1 {
+            // SAFETY: kill(2) with a pid from our own state file; SIGTERM only.
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+            }
+            any = true;
+        }
+    }
+    any
 }
 
 fn confirm_exit(app: &mut App) -> bool {

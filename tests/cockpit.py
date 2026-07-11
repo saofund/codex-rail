@@ -936,6 +936,27 @@ def audit(rail, pngdir=None):
     finally:
         c.close()
 
+    # 26) a live session whose socket is GONE (e.g. XDG_RUNTIME_DIR was cleared
+    #     while the worker stayed alive) can still be stopped — Ctrl+X twice falls
+    #     back to killing the worker by its recorded pid instead of wedging.
+    c = Cockpit(rail, codex=FAKE_SLEEP).boot()
+    try:
+        c.seed_running_worker("sock-gone", "STUCK")
+        c.wait_until(lambda: c.row_with("STUCK") is not None, timeout=8)
+        child = c._pid("sock-gone", "child_pid")
+        sock = json.load(open(f"{c.jobs}/sock-gone/state.json"))["socket"]
+        if sock and os.path.exists(sock):
+            os.remove(sock)                                  # vanish the socket
+        c.key(b"\x18", 0.5); c.key(b"\x18", 1.2)             # Ctrl+X twice -> stop
+        def _alive(p):
+            try: os.kill(p, 0); return True
+            except OSError: return False
+        killed = child is not None and not _alive(child)
+        check("stop: socket-gone live session is killed by the pid fallback",
+              killed, f"child={child} killed={killed}")
+    finally:
+        c.close()
+
     # ---- summary
     npass = sum(1 for _, ok, _ in results if ok)
     print(f"\n==== {npass}/{len(results)} checks PASS ====")
