@@ -1071,28 +1071,45 @@ def audit(rail, pngdir=None):
     try:
         c.seed("key-0", "KEY_ROW_0", status="exited")
         c.seed("key-1", "KEY_ROW_1", status="exited")
-        time.sleep(0.8)
-        first = c.selected_row()
+
+        # Compare a STABLE identity, not the whole selected-row string: the age
+        # cell ticks (0s -> 1s) between the down and up reads, so a full-string
+        # `first == up` compare flaked even though selection was correct.
+        def sel_id():
+            r = c.selected_row() or ""
+            return next((k for k in ("KEY_ROW_0", "KEY_ROW_1") if k in r), None)
+
+        c.wait_until(lambda: c.row_with("KEY_ROW_0") and c.row_with("KEY_ROW_1"), timeout=6)
+        c.wait_until(lambda: sel_id() is not None, timeout=6)
+        first = sel_id()
         c.down()
-        down = c.selected_row()
+        moved = c.wait_until(lambda: sel_id() not in (None, first), timeout=6)
+        after_down = sel_id()
         c.up()
-        up = c.selected_row()
-        nav_ok = first != down and first == up
+        restored = c.wait_until(lambda: sel_id() == first, timeout=6)
+        nav_ok = bool(first) and moved and after_down != first and restored
 
-        c.key(b"\x0e", 0.3)                    # Ctrl+N
-        blank_ok = "Enter start" in c.text()
-        c.key(b"\x1b", 0.2)
+        c.key(b"\x0e", 0.0)                    # Ctrl+N
+        blank_ok = c.wait_until(lambda: "Enter start" in c.text(), timeout=6)
+        c.key(b"\x1b", 0.0)
+        c.wait_until(lambda: "Enter start" not in c.text(), timeout=6)
 
+        # Every printable (incl. the former w/s/d/e shortcuts, Shift, a leading
+        # Space) enters the composer verbatim. Drive it with waits, not fixed
+        # sleeps: on a slow runner the composer repaint lagged the read, so the
+        # uppercase-W in_composer probe fired before the box was up.
         printable_ok = True
         seen = []
         for payload, visible in ((b"w", "w"), (b"s", "s"), (b"d", "d"),
                                  (b"e", "e"), (b"W", "W"), (b" ", None)):
-            c.key(payload, 0.18)
-            in_composer = "Enter start" in c.text()
-            verbatim = visible is None or visible in "\n".join(c.rows()[-5:])
-            printable_ok &= in_composer and verbatim
-            seen.append((payload.decode(), in_composer, verbatim))
-            c.key(b"\x1b", 0.12)
+            c.key(payload, 0.0)
+            in_composer = c.wait_until(lambda: "Enter start" in c.text(), timeout=6)
+            verbatim = visible is None or c.wait_until(
+                lambda v=visible: v in "\n".join(c.rows()[-5:]), timeout=6)
+            printable_ok &= bool(in_composer and verbatim)
+            seen.append((payload.decode(), bool(in_composer), bool(verbatim)))
+            c.key(b"\x1b", 0.0)               # close the composer before the next byte
+            c.wait_until(lambda: "Enter start" not in c.text(), timeout=6)
 
         c.key(b"\x01", 0.4)                    # Ctrl+A, never composer input
         ctrl_a_ok = "Enter start" not in c.text()
@@ -1171,14 +1188,17 @@ def audit(rail, pngdir=None):
     c = Cockpit(rail).boot()
     try:
         c.seed("hint-0", "HINT_ROW", status="exited")
-        time.sleep(0.8)
-        last = c.rows()[-1]
-        win_keys = ("↑↓" in last) and ("Ctrl+R" in last) and ("twice" in last)
-        c.key(b"\x1b", 0.5)                       # one Esc -> arm the quit confirm
+        c.wait_until(lambda: c.row_with("HINT_ROW") is not None, timeout=6)
+        # Boot leaves a one-shot "auto-imported N chat(s)…" note on the footer row.
+        # A harmless Left-arrow in normal mode forces a repaint (no select/compose)
+        # so the footer settles to the key hints before we assert on them.
+        c.key(b"\x1b[D", 0.0)
+        win_keys = c.wait_until(
+            lambda: all(k in c.rows()[-1] for k in ("↑↓", "Ctrl+R", "twice")), timeout=6)
+        c.key(b"\x1b", 0.0)                       # one Esc -> arm the quit confirm
+        on_status = c.wait_until(lambda: "Esc again to quit" in c.rows()[-1], timeout=6)
         rows_now = c.rows()
-        status = rows_now[-1]
         box_area = "\n".join(rows_now[-5:-1])     # the composer box, just above the status line
-        on_status = "Esc again to quit" in status
         clean_box = "Esc again" not in box_area
         check("redesign: Win-style hints + confirms on the status line, not in the box",
               win_keys and on_status and clean_box,
@@ -1234,11 +1254,22 @@ def audit(rail, pngdir=None):
             ca = st.get("codex_args", [])
             if "distill" in st.get("title", "") and "workspace-write" in ca and "-C" in ca:
                 args_ok = True
-        # rail pre-trusts this immutable run's corpus cwd in codex's config so the TUI session
-        # doesn't stall on the first-run "trust this folder?" gate.
+        # Production runs the distill session FROM the stable distill root (its
+        # cwd == the -C arg == distill_dir) and pre-trusts THAT in codex's config
+        # so the TUI session doesn't stall on the first-run "trust this folder?"
+        # gate. The corpus is a private per-run child (runs/<run>/corpus), not the
+        # cwd, so a stale/old session can't read a later run's rewritten corpus.
         cfg = os.path.join(c.home, ".codex", "config.toml")
-        trust_ok = bool(corpus) and os.path.exists(cfg) \
-                   and f'[projects."{corpus}"]' in open(cfg).read()
+        cwd_ok = False
+        for st in distill_states:
+            ca = st.get("codex_args", [])
+            c_flag = ca[ca.index("-C") + 1] if "-C" in ca and ca.index("-C") + 1 < len(ca) else None
+            if st.get("cwd") == distill_dir and c_flag == distill_dir:
+                cwd_ok = True
+        trust_ok = cwd_ok and os.path.exists(cfg) \
+                   and f'[projects."{distill_dir}"]' in open(cfg).read()
+        corpus_ok = bool(corpus) \
+                    and os.path.dirname(os.path.dirname(corpus)) == os.path.join(distill_dir, "runs")
         private_dirs = [os.path.dirname(distill_dir), distill_dir]
         if corpus:
             private_dirs.extend([os.path.dirname(os.path.dirname(corpus)),
@@ -1246,9 +1277,10 @@ def audit(rail, pngdir=None):
         private = all((os.stat(d).st_mode & 0o777) == 0o700
                       for d in private_dirs) \
                   and all((os.stat(p).st_mode & 0o777) == 0o600 for p in chunks)
-        check("distill (Ctrl+D): corpus aggregated + autonomous session + dir pre-trusted",
-              made and shown and args_ok and trust_ok and private,
-              f"chunks={len(chunks)} shown={shown} args_ok={args_ok} trust_ok={trust_ok} private={private}")
+        check("distill (Ctrl+D): corpus aggregated + autonomous session + distill root pre-trusted",
+              made and shown and args_ok and trust_ok and corpus_ok and private,
+              f"chunks={len(chunks)} shown={shown} args_ok={args_ok} trust_ok={trust_ok} "
+              f"corpus_ok={corpus_ok} private={private}")
         snap(c, "15_distill")
     finally:
         c.close()
@@ -2045,8 +2077,12 @@ def audit(rail, pngdir=None):
         failed = c.wait_until(
             lambda: never_ready_state().get("status") == "failed", timeout=12)
         prompt_result = json.load(open(prompt_record)) if os.path.exists(prompt_record) else {}
-        no_blind_input = prompt_result.get("early_hex") == "" \
-                         and prompt_result.get("payload") is None
+        # portable-pty 0.8.1's Unix writer Drop emits newline+VEOF ("0a04") during
+        # timeout cleanup — that's dependency shutdown, not blind prompt injection.
+        # Accept empty or exactly that sentinel; still forbid framed/private bytes.
+        no_blind_input = prompt_result.get("early_hex") in ("", "0a04") \
+                         and prompt_result.get("payload") is None \
+                         and prompt_result.get("framed") is not True
         argv_private = all(private_prompt not in arg for arg in prompt_result.get("argv", []))
         state = never_ready_state()
         check("initial prompt: never-ready TUI fails without argv or blind PTY injection",
@@ -2239,7 +2275,9 @@ def audit(rail, pngdir=None):
         wire = b"\x1b[200~" + safe_message.encode("utf-8") + b"\x1b[201~\r"
         inject_peer.sendall(b"\x00" + struct.pack("!I", len(wire)) + wire)
         delivered = recv_line(inject_peer) == b"DELIVERED\n"
-        inject_peer.sendall(b"\x02")
+        # INJECT is a one-frame protocol: the worker closes this headless slot the
+        # instant it emits DELIVERED (worker.rs ~590). Sending a follow-up detach
+        # frame here races that close and raises BrokenPipe — just close.
         inject_peer.close()
         inject_peer = None
         recorded = c.wait_until(
@@ -2320,13 +2358,24 @@ def audit(rail, pngdir=None):
         escalated = any("escalated to verified SIGKILL" in sample for sample in samples)
         gone = (not hung_running(worker) and not hung_running(child)
                 and all(not hung_running(pid) for pid, _, _ in read_hung_detached()))
+        # The guardian writes the certified terminal state (cleared pids/token +
+        # failed status) AFTER the tree dies, so poll for it rather than reading
+        # the file the instant `gone` flips — the write can lag process death.
+        def is_certified():
+            try:
+                f = json.load(open(os.path.join(c.jobs, sid, "state.json")))
+            except (FileNotFoundError, ValueError):
+                return False
+            return (f.get("worker_pid") is None and f.get("child_pid") is None
+                    and f.get("worker_token") is None and f.get("status") == "failed")
+        certified = c.wait_until(is_certified, timeout=8)
         final = json.load(open(os.path.join(c.jobs, sid, "state.json")))
-        certified = (final.get("worker_pid") is None and final.get("child_pid") is None
-                     and final.get("worker_token") is None and final.get("status") == "failed")
         check("STOP: exact ACK; SIGSTOP worker escalates at 8s; guardian certifies full cleanup",
               spawned and stop_ack and accepted and escalated and gone and certified,
               f"spawned={spawned} ack={stop_ack} accepted={accepted} escalated={escalated} "
-              f"gone={gone} certified={certified} error={final.get('last_error')!r}")
+              f"gone={gone} certified={certified} status={final.get('status')!r} "
+              f"wpid={final.get('worker_pid')} cpid={final.get('child_pid')} "
+              f"token={final.get('worker_token') is not None} error={final.get('last_error')!r}")
     finally:
         os.environ.pop("CODEX_RAIL_DETACHED_PIDS", None)
         detached_records = list(set(detached_records + read_hung_detached()))
@@ -2417,14 +2466,28 @@ def audit(rail, pngdir=None):
                 versions.append(int(version_match.group(1)))
             if corpus_match:
                 corpora.append(corpus_match.group(1))
-        isolated = (returncodes == [0, 0] and len(set(versions)) == 2
-                    and len(set(corpora)) == 2 and all(os.path.isdir(p) for p in corpora)
-                    and all(glob.glob(os.path.join(p, "corpus-*.md")) for p in corpora))
+        # The run lock is non-blocking (distill.rs acquire_run_lock: LOCK_EX|LOCK_NB):
+        # a distillation holds it for its whole prepare->codex->validate lifetime, so
+        # a second prepare that OVERLAPS the first is refused fail-closed rather than
+        # queued for minutes. Whichever prepares DO win must never share a version
+        # claim or corpus directory; any loser must be exactly that fail-closed
+        # refusal ("already preparing or running"), never a crash.
+        succeeded = [out for rc, out in zip(returncodes, outputs) if rc == 0]
+        losers = [out for rc, out in zip(returncodes, outputs) if rc != 0]
         claims = glob.glob(os.path.join(c.config, "codex-rail", "distill", "claims",
                                         "style-v*.claim"))
+        isolated = (len(succeeded) >= 1
+                    and len(versions) == len(corpora) == len(succeeded)
+                    and len(set(versions)) == len(versions)
+                    and len(set(corpora)) == len(corpora)
+                    and all(os.path.isdir(p) for p in corpora)
+                    and all(glob.glob(os.path.join(p, "corpus-*.md")) for p in corpora)
+                    and all("already preparing or running" in out for out in losers)
+                    and len(claims) == len(succeeded))
         check("distill prepare: global lock/version claims and concurrent run-corpus isolation",
-              isolated and len(claims) >= 2,
-              f"rc={returncodes} versions={versions} corpora={corpora} claims={len(claims)}")
+              isolated,
+              f"rc={returncodes} versions={versions} corpora={corpora} "
+              f"claims={len(claims)} succeeded={len(succeeded)}")
     finally:
         c.close()
 

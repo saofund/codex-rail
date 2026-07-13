@@ -1490,7 +1490,13 @@ fn persist_state(session: &SessionState) -> Result<()> {
 
 fn mark_failed_if_owner(id: &str, message: &str) {
     if let Ok(mut session) = state::read_state(id) {
-        if session.worker_pid != Some(process::id()) {
+        // Reject only an EXPLICIT different owner. A None worker_pid means the
+        // failure happened before the final bind persisted our pid (e.g. a
+        // non-socket sits at the canonical path, worker.rs bails pre-bind); at
+        // that point run_worker still holds both worker.lock and socket.lock, so
+        // recording the error is safe and it must not be silently swallowed into
+        // a stuck `starting` row.
+        if session.worker_pid.is_some_and(|pid| pid != process::id()) {
             return;
         }
         session.status = STATUS_FAILED.to_string();
