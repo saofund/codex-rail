@@ -6,19 +6,21 @@ close to Claude Code's agent view: one manager screen, background sessions
 grouped by what they need from you, fast attach/detach, and no tmux or split
 panes.
 
-![Codex Rail manager screen](docs/rail-demo.png)
+![Codex Rail manager showing status groups, mouse hover, and the command palette](docs/rail-demo.gif)
 
 ## What it does
 
-- **Runs sessions in the background.** Each session is its own worker process
+- **Runs sessions in the background.** Each session has a guardian plus a worker
   holding a PTY that runs real `codex`. Closing the manager (or your terminal)
-  leaves sessions running.
+  leaves sessions running; if the worker crashes, the guardian reaps its whole
+  owned process generation before Rail permits a resume.
 - **Groups by status, like Claude Code's agents panel.** Sessions bucket into
   **Needs input** / **Working** / **Stopped**, with the ones wanting your
   attention floating to the top. Each row shows codex's latest message.
 - **Start a session with a first message.** Type your first instruction and
-  press Enter; `rail` launches `codex` with it so the turn starts immediately.
-  Leave it empty for a blank, auto-numbered session.
+  press Enter; `rail` waits for Codex's composer and submits it through the PTY,
+  so private prompt text is never placed in a process argument. Use `Ctrl+N` for
+  a blank, auto-numbered session.
 - **Resume exited sessions.** `rail` records each session's codex id and can
   `codex resume` it, restoring the full conversation.
 - **Live titles.** A session's title follows its first codex message
@@ -27,12 +29,12 @@ panes.
 
 ## How it works
 
-One **manager** process draws the UI; each session gets its own **worker**
-process. They stay decoupled through per-session files, a Unix socket for live
-attach, and codex's own transcript files (read-only). Crucially the two
-processes write **disjoint** files: the worker owns `state.json` (runtime), the
-manager owns `label.json` (the title). Nothing they each write can clobber the
-other.
+One **manager** process draws the UI; each session gets a **guardian** and a
+**worker**. They stay decoupled through per-session files, a Unix socket for
+live attach, and Codex's own transcript files (read-only). The worker owns
+`state.json` runtime fields, while title changes are serialized through
+`label.json`; per-session leases prevent duplicate workers, guardians, title
+writes, removals, and autopilot drivers.
 
 ```
 ┌───────────────────────────────────────────────────────────────┐
@@ -47,9 +49,9 @@ other.
        ▲                                               ▲
  write │ status / codex id / timestamps          PTY  │ input & output
 ┌──────┴────────────────────────────────────────┴───────────────┐
-│  rail --worker <id>  (one per session; outlives the manager)   │
-│   owns a PTY running real codex; binds the Unix socket         │
-│   captures codex's rollout path + session id; reaps its child  │
+│  rail --guardian <id>  (owns and reaps one process generation) │
+│        └─ rail --worker <id>  (PTY + socket + state owner)      │
+│             captures and exclusively claims Codex's rollout    │
 └──────────────────────────┬────────────────────────────────────┘
                      runs codex (real CLI, in the PTY)
                            │ writes
@@ -60,17 +62,18 @@ other.
 
 Design points:
 
-- **Process isolation.** The manager only reads/writes state files and draws;
-  the worker owns the codex process. If the manager dies, sessions keep
-  running; if a worker dies, the manager marks it Stopped on its next refresh.
-- **The title can't be clobbered.** A rename (and automatic title sync) writes
-  only `label.json`, which the manager owns; the worker only ever writes
-  `state.json`. Since the label always wins on load, a rename sticks instantly
-  even while an old — or duplicate — worker keeps rewriting `state.json`.
-- **Preview/status self-heal.** If a worker never recorded a rollout path (a
-  session started blank, a slow cold start, an older build), the manager
-  recovers it by matching codex's own `session_meta` cwd and start time, so the
-  row still shows a live status and codex's latest message instead of a bare path.
+- **Crash-safe process ownership.** The manager can die without stopping
+  sessions. On Linux, each guardian is a subreaper and each worker generation
+  carries a unique token. Stop, resume, and removal fail closed until a process
+  census proves that Codex and all of its MCP/helper descendants are gone.
+- **The title can't be clobbered.** Rename and automatic title sync serialize
+  updates to `label.json`; a pinned user title always wins over worker runtime
+  state and stale automatic sync attempts.
+- **Rollouts cannot cross-wire.** A worker identifies the rollout opened by its
+  own Codex process, checks the exact session id, and claims that path with a
+  no-replace file operation. Rail never guesses by working directory or launch
+  time, so simultaneous sessions in the same directory cannot steal each
+  other's resume id.
 - **Status without guessing.** Activity is read from codex's rollout lifecycle
   (`task_started` … `task_complete`), tracked incrementally: each refresh scans
   only the bytes appended since the last one and latches the most recent marker.
@@ -100,10 +103,13 @@ Design points:
 
 Manager screen (the bottom line always shows the relevant keys):
 
-- `↑` / `↓` (or `w` / `s`): move selection
-- `Enter` (or `→` / `d`, or mouse click): attach the selected session
-- `e`, or just start typing: compose a new session — your text becomes codex's
-  first message (empty → a blank, auto-numbered session)
+- `↑` / `↓`: move selection
+- `Enter` / `→` (or mouse click): attach the selected session
+- mouse hover: softly highlight the row under the pointer without changing the
+  keyboard selection; the wheel still moves the selection
+- just start typing: compose a new session — printable keys such as `w`, `s`,
+  `d`, `e`, and Space are text, never hidden manager shortcuts
+- `Ctrl+N`: start a blank, auto-numbered session
 - `Ctrl+R`: rename the selected session (pins the title against auto-sync)
 - `Ctrl+X` twice within 2s: stop the selected session; press it twice again on an
   already-stopped session to **remove** it from the list (deletes its state, so
@@ -111,7 +117,15 @@ Manager screen (the bottom line always shows the relevant keys):
 - `Ctrl+D`: distill your response style **and problem-solving logic** from your
   past codex *and* Claude Code conversations (see below)
 - `Esc` twice within 2s: leave the manager (sessions keep running)
-- `Space`: toggle **autopilot** on the selected session (see below)
+- `Ctrl+A`: toggle **autopilot** on the selected session (see below)
+- `/`: open Rail's command palette. A unique prefix runs the highlighted command,
+  so `/di` then `Enter` runs `/distill`. Text that is not a Rail command (for
+  example `/review`) remains an ordinary prompt and is sent to Codex on `Enter`.
+- `/import 15d`: extend this manager's Codex-history scan to rollouts modified in
+  the last 15 days. Replace `15` with the window you need.
+- `/import <session_id>`: import one exact Codex session regardless of age. It
+  must still belong to the manager's current working directory; using an exact id
+  also restores a session you previously removed from Rail's imported rows.
 
 Only sections that actually have sessions are shown (an empty *Working* or
 *Needs input* block is hidden rather than drawn as "none"), and the list floats
@@ -146,25 +160,26 @@ keeps each of your turns next to a compressed lead-in of what the assistant had
 just said or done, so the distiller can see *why* you steered the way you did.
 The raw transcripts are huge (hundreds of MB of codex, GBs of Claude, mostly
 re-injected context and tool output), so rail ranks your richest sessions and
-packs them into a small, **fully readable** corpus of numbered chunks under
-`~/.config/codex-rail/distill/corpus/`. The launched codex session is told to
+packs them into a small, **fully readable** corpus of numbered chunks under a
+unique `~/.config/codex-rail/distill/runs/run-*/corpus/`. The launched Codex session is told to
 read every chunk end-to-end (not grep or sample) and echo back a marker from
-each, so a complete read is verifiable rather than assumed.
+each, giving Rail a machine-checkable completion signal that rejects stale or
+partial outputs (without pretending model-side reading is cryptographically provable).
 
 The scan runs on a background thread — the manager stays live and shows a
 "Preparing … Ns" status while it works — then launches a session tagged
 **`[distill vN]`**. It shows an elapsed-time / rough-ETA hint while running and
-flips to a **Done** status once `style-vNNN.md` lands (it's a one-shot task, not
-a chat waiting on you). Attach to watch it, or just check the file. Each run
-writes the next version number, so your profile can be re-distilled and compared
-over time. (Everything stays local under `~/.config/codex-rail` and is never
-committed.)
+flips to **Done** only after Codex is waiting, the exact coverage contract has
+validated, the output is durably marked, and the one-shot worker has exited.
+Concurrent managers share one lifetime lock and reserve versions atomically, so
+they cannot overwrite a corpus or style version. (Everything stays local under
+`~/.config/codex-rail` and is never committed.)
 
 Prompts are English-only for now.
 
 ## Autopilot
 
-Press **`Space`** on a session to hand it to **autopilot** — rail answers it for
+Press **`Ctrl+A`** on a session to hand it to **autopilot** — rail answers it for
 you while you're away. Under the hood rail launches a **pilot**: a real, visible
 codex session (it appears grouped right under its main as `↳ pilot · …`, and you
 can attach to it to watch or step in at any time). Each time the main session
@@ -180,8 +195,9 @@ It stays in your control:
 - The pilot hands back (and autopilot stops) when the task looks **done**, when
   something **risky/irreversible** is proposed, when it's **unsure**, or after a
   **reply cap** (default 8; `CODEX_RAIL_AUTOPILOT_CAP`) — so it never runs away.
-- Attach to the main at any time; while you're attached rail won't inject, so you
-  can just take over. `Space` again turns autopilot off.
+- Attach to the main at any time; while you're attached Rail's explicit inject
+  handshake returns busy and sends no bytes, so you can take over safely.
+  `Ctrl+A` again turns autopilot off and cleans up the linked pilot.
 - The pilot runs **read-only** and at a lighter reasoning effort for speed
   (`CODEX_RAIL_PILOT_EFFORT`, `CODEX_RAIL_PILOT_MODEL` to override); it inherits
   your codex model otherwise.
@@ -191,10 +207,9 @@ for high-stakes judgment calls — which is exactly what the hand-back rules pro
 
 ## Install
 
-Download the prebuilt binary for your platform from the [latest
-release](https://github.com/saofund/codex-rail/releases/latest) — `rail-x86_64-linux`
-/ `rail-aarch64-linux` (static, any distro) or `rail-aarch64-macos` (Apple
-Silicon) — then:
+Download the static Linux binary for your architecture from the [latest
+release](https://github.com/saofund/codex-rail/releases/latest) —
+`rail-x86_64-linux` or `rail-aarch64-linux` — then:
 
 ```sh
 install -m755 rail-x86_64-linux ~/.local/bin/rail
@@ -209,11 +224,11 @@ install -m755 target/release/rail ~/.local/bin/rail
 
 ## Update
 
-`rail --version` shows the build. Run **`rail update`** (or **`/update`** in the
-manager) to fetch the latest release binary for your platform and replace itself
-in place; the manager also shows a quiet **"↑ update available"** in the header
-when a newer build is out. Set `CODEX_RAIL_CODEX=/path/to/codex` if `codex` is not
-on `PATH`.
+`rail --version` shows the build. On Linux, run **`rail update`** (or
+**`/update`** in the manager) to fetch the matching release asset, verify its
+format and exact build identity, and replace the executable atomically; the
+manager also shows a quiet **"↑ update available"** in the header. Set
+`CODEX_RAIL_CODEX=/path/to/codex` if `codex` is not on `PATH`.
 
 ## Data layout
 
@@ -223,11 +238,14 @@ on `PATH`.
   - `output.log` — per-session terminal output
   - `.locks/<id>.init.lock` — serializes manager resume/remove for one session
   - `.locks/<id>.worker.lock` — held for the lifetime of the session worker
+  - `.locks/<id>.generation.lock` — held while a guardian owns/cleans a generation
+  - `.locks/<id>.autopilot.lock` — lets one manager drive a main session's pilot
   - `.stop-<generation>.request` — socket-independent, generation-scoped stop fallback
 - Sockets: `$XDG_RUNTIME_DIR/codex-rail` (or `/tmp/codex-rail-$UID`)
 - Distillation: `$XDG_CONFIG_HOME/codex-rail/distill` (or `~/.config/codex-rail/distill`)
-  - `style-vNNN.md` — the versioned distilled style summaries
-  - `corpus/` — the aggregated, codex-readable message chunks (regenerated each run)
+  - `style-vNNN.md` + `.validated` — validated, versioned style summaries
+  - `runs/run-*/corpus/` — run-isolated message chunks
+  - `claims/style-vNNN.claim` — atomic, no-reuse version reservations
 
 State, socket, and distillation data are locked to the owner (`0600` files,
 `0700` directories). On startup rail also tightens permissions left by older
@@ -235,12 +253,19 @@ versions without following symlinks outside its data directories.
 
 ## Limits
 
-- Unix-like systems only.
-- Rail can adopt Codex histories created in the current working directory as
-  resumable rows. Live process control is limited to sessions launched or
-  resumed through rail.
+- Linux only. Rail intentionally refuses to start sessions on other Unix
+  targets: its no-orphan guarantee requires Linux subreapers and `/proc` process
+  identity/census support. In particular, macOS is not published as a supported
+  asset until an equivalent crash-cleanup proof exists.
+- Rail automatically imports only Codex rollouts from the current working
+  directory that were modified in the last **7 days** and contain a genuine user
+  turn. Older, empty, synthetic-marker-only, and other-directory transcripts do
+  not clutter the initial list. The startup hint advertises `/import 15d` and
+  `/import <session_id>` when you need to widen that scope; an exact id bypasses
+  age, never the current-directory boundary. Live process control is limited to
+  sessions launched or resumed through Rail.
 - One active attachment per session; a second attach is refused until the first
   detaches.
-- Status and title sync rely on codex's on-disk transcript format, which is
-  undocumented and may change between codex versions (verified against
-  codex-cli 0.142.5).
+- Status and title sync rely on Codex's on-disk transcript format, which is
+  undocumented and may change between Codex versions; the fixture and live
+  compatibility gates must be refreshed when that format changes.

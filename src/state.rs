@@ -1,15 +1,16 @@
+use crate::process_tree;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const APP_DIR: &str = "codex-rail";
 pub const STATUS_STARTING: &str = "starting";
@@ -54,6 +55,11 @@ pub struct SessionState {
     // then cleared so a later resume/restart doesn't replay it. None = plain.
     #[serde(default)]
     pub initial_prompt: Option<String>,
+    // True only during the tiny crash-sensitive PTY delivery window. A worker
+    // that inherits this state must fail closed instead of replaying a prompt
+    // whose external side effect may already have happened.
+    #[serde(default)]
+    pub initial_prompt_injecting: bool,
     // Set once the user renames via Ctrl+R. Pins the title so the automatic
     // "sync from codex's first message" pass leaves their chosen name alone.
     #[serde(default)]
@@ -74,6 +80,17 @@ pub struct SessionState {
     // lands. None for ordinary sessions.
     #[serde(default)]
     pub distill_version: Option<u32>,
+    // Machine-verifiable completion contract for a distillation run. Old
+    // states intentionally deserialize to an empty contract and can never be
+    // auto-classified Done from a merely non-empty style file.
+    #[serde(default)]
+    pub distill_expected_markers: Vec<String>,
+    #[serde(default)]
+    pub distill_expected_user_turns: Option<usize>,
+    #[serde(default)]
+    pub distill_corpus_rel: Option<String>,
+    #[serde(default)]
+    pub distill_validated: bool,
     // True for an IMPORTED codex session — one discovered in ~/.codex/sessions for
     // the manager's cwd but not started by rail. In-memory only (never serialized):
     // the row is a resumable snapshot until the user attaches, at which point it's
@@ -157,10 +174,10 @@ pub fn config_dir() -> PathBuf {
     home_dir().join(".config").join(APP_DIR)
 }
 
-// Working root for archive distillation: the versioned `style-vNNN.md` summaries
-// live here, and `corpus/` holds the freshly-aggregated, codex-readable chunks
-// (regenerated every run). Also the cwd of the launched distill codex session,
-// so codex only ever reads/writes inside this dir (never ~/.codex directly).
+// Working root for archive distillation: versioned `style-vNNN.md` summaries
+// live here, while `runs/run-*/corpus/` keeps each launched Codex session on
+// immutable inputs. Also the cwd of the distill session, so Codex only ever
+// reads/writes inside this directory (never ~/.codex directly).
 pub fn distill_dir() -> PathBuf {
     config_dir().join("distill")
 }
@@ -176,10 +193,12 @@ fn worker_stop_request_path(id: &str, token: &str) -> Result<PathBuf> {
 }
 
 pub fn ensure_base_dirs() -> Result<()> {
-    fs::create_dir_all(jobs_dir()).context("create jobs directory")?;
-    restrict_to_owner(&jobs_dir())?;
-    fs::create_dir_all(runtime_dir()).context("create runtime directory")?;
-    restrict_to_owner(&runtime_dir())?;
+    ensure_owner_dir(&jobs_dir())?;
+    // XDG_RUNTIME_DIR is not guaranteed in containers, so the fallback lives
+    // under world-writable /tmp.  Refuse a pre-created symlink, non-directory,
+    // or directory owned by another uid before ever placing a control socket in
+    // it; chmod alone would follow a symlink and is not an ownership check.
+    ensure_owner_dir(&runtime_dir())?;
     Ok(())
 }
 
@@ -193,7 +212,31 @@ pub fn ensure_private_distill_storage() -> Result<()> {
     secure_private_dir(&distill_dir())
 }
 
+/// Create or validate one exact private directory without trusting umask or
+/// following a pre-created symlink. Callers that build a nested tree use this
+/// one level at a time so every intermediate is owner-only from creation.
+pub fn ensure_private_directory(path: &Path) -> Result<()> {
+    ensure_owner_dir(path)
+}
+
 fn secure_private_dir(path: &Path) -> Result<()> {
+    ensure_owner_dir(path)?;
+    for entry in fs::read_dir(path).with_context(|| format!("read {}", path.display()))? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let child = entry.path();
+        if kind.is_dir() {
+            secure_private_dir(&child)?;
+        } else if kind.is_file() {
+            restrict_file_to_owner(&child)?;
+        }
+        // Never follow symlinks while migrating an existing tree: a link may
+        // intentionally point outside rail's private storage.
+    }
+    Ok(())
+}
+
+fn ensure_owner_dir(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => {
             bail!("refuse symlinked private directory {}", path.display())
@@ -210,19 +253,20 @@ fn secure_private_dir(path: &Path) -> Result<()> {
         }
         Err(err) => return Err(err).with_context(|| format!("inspect {}", path.display())),
     }
-    restrict_to_owner(path)?;
-    for entry in fs::read_dir(path).with_context(|| format!("read {}", path.display()))? {
-        let entry = entry?;
-        let kind = entry.file_type()?;
-        let child = entry.path();
-        if kind.is_dir() {
-            secure_private_dir(&child)?;
-        } else if kind.is_file() {
-            restrict_file_to_owner(&child)?;
-        }
-        // Never follow symlinks while migrating an existing tree: a link may
-        // intentionally point outside rail's private storage.
+    let meta = fs::symlink_metadata(path).with_context(|| format!("inspect {}", path.display()))?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        bail!("private path is not a real directory: {}", path.display());
     }
+    let euid = unsafe { libc::geteuid() };
+    if meta.uid() != euid {
+        bail!(
+            "private directory {} is owned by uid {}, expected {}",
+            path.display(),
+            meta.uid(),
+            euid
+        );
+    }
+    restrict_to_owner(path)?;
     Ok(())
 }
 
@@ -248,6 +292,63 @@ pub fn write_private_file(path: &Path, bytes: impl AsRef<[u8]>) -> Result<()> {
     file.set_permissions(fs::Permissions::from_mode(0o600))?;
     file.write_all(bytes.as_ref())
         .with_context(|| format!("write {}", path.display()))
+}
+
+/// Atomically replace a sensitive file without ever exposing a partial JSON or
+/// following a pre-created temporary symlink. The sibling temporary is 0600
+/// from creation, flushed before rename, and the containing directory is synced
+/// so a successful return survives a crash as far as the filesystem permits.
+pub fn write_private_file_atomic(path: &Path, bytes: impl AsRef<[u8]>) -> Result<()> {
+    let parent = path.parent().context("private output has no parent")?;
+    fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    restrict_to_owner(parent)?;
+
+    let mut tmp = None;
+    for _ in 0..16 {
+        let candidate = unique_tmp_path(
+            parent,
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("private"),
+        );
+        match fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                tmp = Some((candidate, file));
+                break;
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err).with_context(|| format!("create {}", candidate.display())),
+        }
+    }
+    let (tmp_path, mut file) = tmp.context("could not allocate a private temporary file")?;
+    let result = (|| -> Result<()> {
+        if !file.metadata()?.is_file() {
+            bail!(
+                "private temporary is not a regular file: {}",
+                tmp_path.display()
+            );
+        }
+        file.write_all(bytes.as_ref())
+            .with_context(|| format!("write {}", tmp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("sync {}", tmp_path.display()))?;
+        drop(file);
+        fs::rename(&tmp_path, path).with_context(|| format!("replace {}", path.display()))?;
+        fs::File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .with_context(|| format!("sync {}", parent.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    result
 }
 
 pub fn restrict_private_file_to_owner(path: &Path) -> Result<()> {
@@ -281,9 +382,13 @@ fn open_lock_path(path: &Path, nonblocking: bool) -> Result<Option<fs::File>> {
         .read(true)
         .write(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(&path)
         .with_context(|| format!("open {}", path.display()))?;
-    restrict_file_to_owner(&path)?;
+    if !file.metadata()?.is_file() {
+        bail!("lock path is not a regular file: {}", path.display());
+    }
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
     let flags = libc::LOCK_EX | if nonblocking { libc::LOCK_NB } else { 0 };
     loop {
         if unsafe { libc::flock(file.as_raw_fd(), flags) } == 0 {
@@ -301,12 +406,6 @@ fn open_lock_path(path: &Path, nonblocking: bool) -> Result<Option<fs::File>> {
     }
 }
 
-/// Serialize manager-side bootstrap/removal for one session. The returned file
-/// must stay alive for the whole critical section.
-pub fn acquire_session_init_lock(id: &str) -> Result<fs::File> {
-    open_session_lock(id, "init.lock", false)?.context("blocking lock returned no guard")
-}
-
 pub fn try_acquire_session_init_lock(id: &str) -> Result<Option<fs::File>> {
     open_session_lock(id, "init.lock", true)
 }
@@ -317,13 +416,41 @@ pub fn try_acquire_worker_lock(id: &str) -> Result<Option<fs::File>> {
     open_session_lock(id, "worker.lock", true)
 }
 
+/// A second, runtime-filesystem lease around the canonical socket pathname.
+/// This remains independent from jobs/.locks so a broken/NFS data-dir flock
+/// cannot let two workers both unlink/bind the same local control socket.
+pub fn try_acquire_socket_lock(id: &str) -> Result<Option<fs::File>> {
+    validate_session_id(id)?;
+    ensure_owner_dir(&runtime_dir())?;
+    open_lock_path(&runtime_dir().join(format!("{id}.socket.lock")), true)
+}
+
+/// Guardian lifetime lease. A guardian outlives its worker long enough to reap
+/// reparented Codex/MCP descendants, so resume/removal must wait for this lease
+/// before touching the persisted generation token.
+pub fn acquire_session_generation_lock(id: &str) -> Result<fs::File> {
+    open_session_lock(id, "generation.lock", false)?
+        .context("blocking generation lock returned no guard")
+}
+
+pub fn try_acquire_session_generation_lock(id: &str) -> Result<Option<fs::File>> {
+    open_session_lock(id, "generation.lock", true)
+}
+
+/// Become the only manager allowed to advance an enabled autopilot for this
+/// main session. Keeping the returned file alive is the lease.
+pub fn try_acquire_autopilot_lock(id: &str) -> Result<Option<fs::File>> {
+    open_session_lock(id, "autopilot.lock", true)
+}
+
 /// Ask a lock-aware worker to stop without relying on its Unix socket or pid.
 /// This is the portable fallback when a runtime directory has been cleared:
 /// the lifetime lock proves that this session still has a worker, while the
 /// generation-scoped marker prevents a late request from reaching a successor.
 pub fn request_worker_stop(id: &str) -> Result<()> {
     validate_session_id(id)?;
-    let _init_lock = acquire_session_init_lock(id)?;
+    let _init_lock = try_acquire_session_init_lock(id)?
+        .context("another manager is changing this session; retry stop")?;
     let current = read_state(id)?;
     if !current.worker_lock_protocol {
         bail!("worker does not support out-of-band stop requests");
@@ -354,7 +481,10 @@ pub fn take_worker_stop_request(state: &SessionState) -> Result<bool> {
         Err(err) => return Err(err).with_context(|| format!("inspect {}", path.display())),
     };
     if !meta.is_file() {
-        bail!("worker stop request is not a regular file: {}", path.display());
+        bail!(
+            "worker stop request is not a regular file: {}",
+            path.display()
+        );
     }
     fs::remove_file(&path).with_context(|| format!("consume {}", path.display()))?;
     Ok(true)
@@ -400,12 +530,11 @@ pub fn write_state(state: &SessionState) -> Result<()> {
     fs::create_dir_all(&dir).context("create job directory")?;
     restrict_to_owner(&dir)?;
     let path = state_path(&state.id);
-    let tmp = unique_tmp_path(&dir, "state.json");
     let bytes = serde_json::to_vec_pretty(state).context("serialize state")?;
-    fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
-    restrict_file_to_owner(&tmp)?;
-    fs::rename(&tmp, &path).with_context(|| format!("rename {}", path.display()))?;
-    Ok(())
+    // state.json carries exactly-once prompt intent and the only recovery token
+    // for a killed worker. File+directory sync is part of correctness, not an
+    // optional durability optimization.
+    write_private_file_atomic(&path, bytes)
 }
 
 // The session's user-facing label — its title and whether the user pinned it
@@ -425,27 +554,60 @@ struct Label {
 }
 
 pub fn read_label(id: &str) -> Option<(String, bool)> {
-    let bytes = fs::read(label_path(id)).ok()?;
-    let label: Label = serde_json::from_slice(&bytes).ok()?;
-    Some((label.title, label.title_pinned))
+    read_label_result(id)
+        .ok()
+        .flatten()
+        .map(|label| (label.title, label.title_pinned))
 }
 
 pub fn write_label(id: &str, title: &str, title_pinned: bool) -> Result<()> {
     validate_session_id(id)?;
+    let _lock = open_session_lock(id, "label.lock", false)?
+        .context("blocking label lock returned no guard")?;
+    write_label_unlocked(id, title, title_pinned)
+}
+
+/// Refresh an automatically-derived title without racing a user rename from a
+/// second Rail window.  The caller's in-memory `title_pinned` bit is only a
+/// snapshot; the label is re-read under the same lock used by Ctrl+R and a
+/// pinned value always wins.
+pub fn sync_label_if_unpinned(id: &str, title: &str) -> Result<(String, bool)> {
+    validate_session_id(id)?;
+    let _lock = open_session_lock(id, "label.lock", false)?
+        .context("blocking label lock returned no guard")?;
+    if let Some(label) = read_label_result(id)? {
+        if label.title_pinned {
+            return Ok((label.title, true));
+        }
+    }
+    write_label_unlocked(id, title, false)?;
+    Ok((title.to_string(), false))
+}
+
+fn read_label_result(id: &str) -> Result<Option<Label>> {
+    validate_session_id(id)?;
+    let path = label_path(id);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
+    };
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse {}", path.display()))
+        .map(Some)
+}
+
+fn write_label_unlocked(id: &str, title: &str, title_pinned: bool) -> Result<()> {
     let dir = job_dir(id);
     fs::create_dir_all(&dir).context("create job directory")?;
     restrict_to_owner(&dir)?;
     let path = label_path(id);
-    let tmp = unique_tmp_path(&dir, "label.json");
     let label = Label {
         title: title.to_string(),
         title_pinned,
     };
     let bytes = serde_json::to_vec_pretty(&label).context("serialize label")?;
-    fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
-    restrict_file_to_owner(&tmp)?;
-    fs::rename(&tmp, &path).with_context(|| format!("rename {}", path.display()))?;
-    Ok(())
+    write_private_file_atomic(&path, bytes)
 }
 
 fn unique_tmp_path(dir: &Path, stem: &str) -> PathBuf {
@@ -657,9 +819,7 @@ fn legacy_worker_is_running(state: &SessionState) -> bool {
         // filesystem's flock service is broken or an old/new binary overlaps.
         return UnixStream::connect(&state.socket).is_ok();
     }
-    let identity = state
-        .worker_pid
-        .map(|pid| worker_identity(pid, &state.id));
+    let identity = state.worker_pid.map(|pid| worker_identity(pid, &state.id));
     identity == Some(WorkerIdentity::Match)
         || (identity == Some(WorkerIdentity::Unknown)
             && matches!(
@@ -681,13 +841,42 @@ pub fn worker_matches_session(pid: Option<u32>, id: &str) -> bool {
 /// session's dir would pull the ground out from under its worker.
 pub fn remove_session(id: &str) -> Result<()> {
     validate_session_id(id)?;
-    let _init_lock = acquire_session_init_lock(id)?;
+    let _init_lock = try_acquire_session_init_lock(id)?
+        .context("another manager is changing this session; retry removal")?;
+    let _generation_lock = try_acquire_session_generation_lock(id)?
+        .context("session guardian is still cleaning its process generation; retry removal")?;
     let Some(_worker_lock) = try_acquire_worker_lock(id)? else {
         bail!("session still has a live worker");
     };
-    if let Some(current) = read_state_optional(id)? {
+    if let Some(mut current) = read_state_optional(id)? {
         if legacy_worker_is_running(&current) {
             bail!("session state still belongs to a live worker");
+        }
+        // A SIGKILLed worker can leave Codex/MCP descendants alive while the
+        // manager's reconciled row merely looks exited.  Never delete the only
+        // persisted generation token until a token census proves the old run is
+        // empty; otherwise the leak becomes permanently unowned.
+        if let Some(token) = current.worker_token.clone() {
+            let report = process_tree::terminate_generation_by_token(
+                &token,
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+            );
+            if !report.is_clean() {
+                current.status = STATUS_FAILED.to_string();
+                current.worker_pid = None;
+                current.updated_at = now_secs();
+                current.last_error = Some(format!(
+                    "refused removal because abandoned process cleanup was not verified: {} survivor(s), census verified={}",
+                    report.survivors, report.verified
+                ));
+                write_state(&current)?;
+                bail!("abandoned process generation is not verified clean; session kept");
+            }
+            current.worker_pid = None;
+            current.child_pid = None;
+            current.worker_token = None;
+            write_state(&current)?;
         }
     }
     // Best-effort socket cleanup; a cleanly-exited worker already removed it.
@@ -726,15 +915,37 @@ pub fn adopt_dismissed() -> std::collections::HashSet<String> {
 }
 
 pub fn dismiss_adopted(id: &str) -> Result<()> {
+    validate_session_id(id)?;
     ensure_base_dirs()?;
     let mut cur = adopt_dismissed();
     if cur.insert(id.to_string()) {
         let mut body: Vec<String> = cur.into_iter().collect();
         body.sort();
-        fs::write(adopt_dismiss_path(), body.join("\n") + "\n")
+        write_private_file_atomic(&adopt_dismiss_path(), body.join("\n") + "\n")
             .context("write adopt dismiss list")?;
     }
     Ok(())
+}
+
+// An explicit `/import <session_id>` reverses a previous in-memory-row dismiss.
+// The Codex transcript was never deleted; this only removes the id from Rail's
+// private skip list. Returns whether an entry was actually removed.
+pub fn restore_adopted(id: &str) -> Result<bool> {
+    validate_session_id(id)?;
+    ensure_base_dirs()?;
+    let mut cur = adopt_dismissed();
+    if !cur.remove(id) {
+        return Ok(false);
+    }
+    let mut body: Vec<String> = cur.into_iter().collect();
+    body.sort();
+    let bytes = if body.is_empty() {
+        String::new()
+    } else {
+        body.join("\n") + "\n"
+    };
+    write_private_file_atomic(&adopt_dismiss_path(), bytes).context("write adopt dismiss list")?;
+    Ok(true)
 }
 
 fn home_dir() -> PathBuf {
@@ -779,11 +990,13 @@ pub fn codex_home_dir() -> PathBuf {
 pub fn codex_first_messages() -> std::collections::HashMap<String, String> {
     let mut map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let path = codex_home_dir().join("history.jsonl");
-    let Ok(content) = fs::read_to_string(&path) else {
+    let Ok(file) = fs::File::open(&path) else {
         return map;
     };
-    for line in content.lines() {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+    // history.jsonl can grow for years. Stream it line-by-line instead of
+    // allocating a second full copy on every refresh/cache miss.
+    for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
         let (Some(sid), Some(text)) = (
@@ -826,6 +1039,9 @@ pub fn rollout_head(path: &Path) -> Option<(String, String)> {
     let mut first = String::new();
     reader.read_line(&mut first).ok()?;
     let value: serde_json::Value = serde_json::from_str(first.trim()).ok()?;
+    if value.get("type").and_then(|kind| kind.as_str()) != Some("session_meta") {
+        return None;
+    }
     let payload = value.get("payload")?;
     let cwd = payload.get("cwd").and_then(|c| c.as_str())?.to_string();
     let sid = payload
@@ -871,13 +1087,14 @@ pub fn is_synthetic_marker(s: &str) -> bool {
 
 // The first genuine user message in a rollout, to title an imported session when
 // codex's history.jsonl doesn't have it (an old session, or history was cleared).
-// Reads only the top of the file (the first turn is near the start). Best-effort.
-// Skips codex's injected context turns (<environment_context>, <user_instructions>)
-// and slash-command echoes so the title is the user's real first line, not a marker.
+// Returns as soon as it finds the first real turn, which is normally near the
+// top, but does not impose a line-count cutoff: a long injected-context prelude
+// must not make an otherwise real chat look empty. Best-effort. Skips codex's
+// injected context turns and slash-command echoes so the title is real prose.
 pub fn rollout_first_user_message(path: &Path) -> Option<String> {
     let file = fs::File::open(path).ok()?;
     let reader = std::io::BufReader::new(file);
-    for line in reader.lines().take(300).map_while(Result::ok) {
+    for line in reader.lines().map_while(Result::ok) {
         if !line.contains("user_message") {
             continue;
         }
@@ -901,6 +1118,127 @@ pub fn rollout_first_user_message(path: &Path) -> Option<String> {
     None
 }
 
+/// Strictly determine whether a rollout already contains a genuine user turn.
+/// Used when resuming a private initial prompt that was never marked delivered:
+/// an existing user turn means a human/older worker already submitted it, while
+/// no turn means Rail can safely retry.  I/O or JSON ambiguity is an error, not
+/// permission to duplicate a private prompt.
+pub fn rollout_has_genuine_user_message(path: &Path) -> Result<bool> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("open rollout {}", path.display()))?;
+    if !file.metadata()?.is_file() {
+        bail!("rollout is not a regular file: {}", path.display());
+    }
+    for line in std::io::BufReader::new(file).lines() {
+        let line = line.with_context(|| format!("read rollout {}", path.display()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_str(&line)
+            .with_context(|| format!("parse rollout {}", path.display()))?;
+        if value.get("type").and_then(|t| t.as_str()) != Some("event_msg") {
+            continue;
+        }
+        let payload = value.get("payload");
+        if payload.and_then(|p| p.get("type")).and_then(|t| t.as_str()) != Some("user_message") {
+            continue;
+        }
+        if let Some(message) = payload
+            .and_then(|p| p.get("message"))
+            .and_then(|m| m.as_str())
+        {
+            if !is_synthetic_marker(message) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+#[derive(Serialize, Deserialize)]
+struct RolloutClaim {
+    session_id: String,
+    path: String,
+}
+
+/// Atomically reserve one Codex rollout for one Rail session. Concurrent
+/// same-cwd workers must never both persist the first path they happen to scan.
+pub fn try_claim_rollout(session_id: &str, path: &Path) -> Result<bool> {
+    validate_session_id(session_id)?;
+    let canonical = fs::canonicalize(path)
+        .with_context(|| format!("canonicalize rollout {}", path.display()))?;
+    let path_text = canonical.to_string_lossy().to_string();
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in path_text.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let dir = jobs_dir().join(".rollout-claims");
+    ensure_owner_dir(&dir)?;
+    let claim_path = dir.join(format!("{hash:016x}.json"));
+    let claim = RolloutClaim {
+        session_id: session_id.to_string(),
+        path: path_text,
+    };
+    let bytes = serde_json::to_vec(&claim).context("serialize rollout claim")?;
+    let tmp_path = unique_tmp_path(&dir, "rollout-claim");
+    let mut tmp = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&tmp_path)
+        .with_context(|| format!("create rollout claim temp {}", tmp_path.display()))?;
+    tmp.write_all(&bytes)?;
+    tmp.sync_all()?;
+    drop(tmp);
+    let linked = fs::hard_link(&tmp_path, &claim_path);
+    let _ = fs::remove_file(&tmp_path);
+    match linked {
+        Ok(()) => {
+            fs::File::open(&dir)?.sync_all()?;
+            Ok(true)
+        }
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            let existing: RolloutClaim = serde_json::from_slice(
+                &fs::read(&claim_path)
+                    .with_context(|| format!("read rollout claim {}", claim_path.display()))?,
+            )
+            .context("parse rollout claim")?;
+            if existing.path != claim.path {
+                bail!("rollout claim hash collision");
+            }
+            Ok(existing.session_id == session_id)
+        }
+        Err(err) => Err(err).with_context(|| format!("create {}", claim_path.display())),
+    }
+}
+
+pub fn claimed_rollout_for_session(session_id: &str) -> Option<(String, String)> {
+    validate_session_id(session_id).ok()?;
+    let entries = fs::read_dir(jobs_dir().join(".rollout-claims")).ok()?;
+    for entry in entries.flatten() {
+        let Ok(bytes) = fs::read(entry.path()) else {
+            continue;
+        };
+        let Ok(claim) = serde_json::from_slice::<RolloutClaim>(&bytes) else {
+            continue;
+        };
+        if claim.session_id != session_id {
+            continue;
+        }
+        let path = PathBuf::from(&claim.path);
+        let Some((_, codex_id)) = rollout_head(&path) else {
+            continue;
+        };
+        return Some((codex_id, claim.path));
+    }
+    None
+}
+
 // Every rollout JSONL under codex's sessions tree.
 pub fn list_rollout_files() -> Vec<PathBuf> {
     let mut out = Vec::new();
@@ -917,9 +1255,12 @@ fn walk_rollouts(dir: &Path, depth: u32, out: &mut Vec<PathBuf>) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_dir() {
             walk_rollouts(&path, depth + 1, out);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+        } else if kind.is_file() && path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
             out.push(path);
         }
     }
@@ -928,8 +1269,8 @@ fn walk_rollouts(dir: &Path, depth: u32, out: &mut Vec<PathBuf>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        checked_pid, is_synthetic_marker, open_lock_path, secure_private_dir,
-        validate_session_id, write_private_file,
+        checked_pid, is_synthetic_marker, open_lock_path, secure_private_dir, validate_session_id,
+        write_private_file, write_private_file_atomic,
     };
     use std::fs;
     use std::os::unix::fs::symlink;
@@ -940,13 +1281,23 @@ mod tests {
         // codex/slash/system markers → skipped in titles and previews
         assert!(is_synthetic_marker("<EXTERNAL SESSION IMPORTED>"));
         assert!(is_synthetic_marker("<command-name>/effort</command-name>"));
-        assert!(is_synthetic_marker("<environment_context>\ncwd: /x</environment_context>"));
-        assert!(is_synthetic_marker("<user_instructions>be nice</user_instructions>"));
-        assert!(is_synthetic_marker("<task-notification>done</task-notification>"));
-        assert!(is_synthetic_marker("  <system-reminder>hi</system-reminder>"));
+        assert!(is_synthetic_marker(
+            "<environment_context>\ncwd: /x</environment_context>"
+        ));
+        assert!(is_synthetic_marker(
+            "<user_instructions>be nice</user_instructions>"
+        ));
+        assert!(is_synthetic_marker(
+            "<task-notification>done</task-notification>"
+        ));
+        assert!(is_synthetic_marker(
+            "  <system-reminder>hi</system-reminder>"
+        ));
         assert!(is_synthetic_marker("[external_agent_tool_result]"));
         assert!(is_synthetic_marker("[external_agent_tool_result: error]"));
-        assert!(is_synthetic_marker("[external_agent_tool_call: AskUserQuestion]"));
+        assert!(is_synthetic_marker(
+            "[external_agent_tool_call: AskUserQuestion]"
+        ));
     }
 
     #[test]
@@ -954,8 +1305,12 @@ mod tests {
         // genuine user/assistant text must NOT be treated as a marker
         assert!(!is_synthetic_marker("看下idependent idea 16_commute_wm"));
         assert!(!is_synthetic_marker("Let's start by reading the file."));
-        assert!(!is_synthetic_marker("<html> is a lowercase tag, real prose"));
-        assert!(!is_synthetic_marker("use the [brackets] like this in a sentence"));
+        assert!(!is_synthetic_marker(
+            "<html> is a lowercase tag, real prose"
+        ));
+        assert!(!is_synthetic_marker(
+            "use the [brackets] like this in a sentence"
+        ));
         assert!(!is_synthetic_marker(""));
     }
 
@@ -975,16 +1330,25 @@ mod tests {
         fs::set_permissions(&old, fs::Permissions::from_mode(0o644)).unwrap();
 
         secure_private_dir(&root).unwrap();
-        assert_eq!(fs::metadata(&root).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
         assert_eq!(
             fs::metadata(&nested).unwrap().permissions().mode() & 0o777,
             0o700
         );
-        assert_eq!(fs::metadata(&old).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&old).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
 
         let new = nested.join("style-v001.md");
         write_private_file(&new, "profile").unwrap();
-        assert_eq!(fs::metadata(&new).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&new).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1041,6 +1405,39 @@ mod tests {
         symlink(&target, &output_link).unwrap();
         assert!(write_private_file(&output_link, "overwrite").is_err());
         assert_eq!(fs::read_to_string(&target).unwrap(), "keep me");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn atomic_private_replace_is_complete_private_and_does_not_follow_destination_symlink() {
+        let root = std::env::temp_dir().join(format!(
+            "rail-private-atomic-{}-{}",
+            std::process::id(),
+            super::now_millis()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let victim = root.join("victim");
+        let dest = root.join("autopilot.json");
+        fs::write(&victim, "untouched").unwrap();
+        symlink(&victim, &dest).unwrap();
+
+        write_private_file_atomic(&dest, br#"{"enabled":true}"#).unwrap();
+
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "untouched");
+        assert_eq!(fs::read_to_string(&dest).unwrap(), r#"{"enabled":true}"#);
+        assert!(!fs::symlink_metadata(&dest)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(fs::read_dir(&root).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".tmp-")));
         let _ = fs::remove_dir_all(&root);
     }
 }

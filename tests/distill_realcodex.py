@@ -5,14 +5,20 @@ launched codex session reads the ENTIRE aggregated corpus (not a grep-sample).
 It builds a small synthetic CODEX_HOME with a recognizable user "voice", runs
 `rail --distill-prepare` (forcing tiny chunks so a handful of messages still
 spans several files), then runs a REAL `codex exec` with the exact prompt rail
-would use — and checks the resulting style file echoes back EVERY chunk marker.
-If codex had grep-sampled or stopped early, some markers would be missing.
+would use. Success requires the same exact machine-readable Coverage contract
+as the worker: each per-run marker exactly once and the exact USER-turn count.
 
     python3 tests/distill_realcodex.py [./target/release/rail]
 
 Slow (a real codex run) — not part of the fast cockpit/regress suites.
 """
-import json, os, re, subprocess, sys, time, shutil
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RAIL = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else os.path.join(REPO, "target/release/rail")
@@ -71,20 +77,37 @@ def main():
     prep = run([RAIL, "--distill-prepare"], env=env, timeout=60)
     print(prep.stdout.rstrip())
     if prep.returncode != 0:
-        print("FAIL: --distill-prepare errored"); return 1
-    markers = re.findall(r"id=([0-9a-f]{8})", prep.stdout)
-    workdir = re.search(r"in (\S+)/corpus", prep.stdout).group(1)
-    out_m = re.search(r"next output: \S+/(style-v\d+\.md)", prep.stdout)
-    out_file = out_m.group(1)
-    prompt_path = re.search(r"prompt: (\S+)", prep.stdout).group(1)
+        print("FAIL: --distill-prepare errored")
+        return 1
+    markers = re.findall(r"^  corpus-\d+\.md id=([0-9a-f]{8})$",
+                         prep.stdout, flags=re.MULTILINE)
+    corpus_m = re.search(r"available -> (\S+/runs/run-[^/]+/corpus)$",
+                         prep.stdout, flags=re.MULTILINE)
+    out_m = re.search(r"^next output: (\S+/style-v\d+\.md)$",
+                      prep.stdout, flags=re.MULTILINE)
+    prompt_m = re.search(r"^prompt: (\S+)$", prep.stdout, flags=re.MULTILINE)
+    turns_m = re.search(r"· (\d+) user turns ·", prep.stdout)
+    if not all((corpus_m, out_m, prompt_m, turns_m)):
+        print("FAIL: could not parse sealed --distill-prepare output")
+        return 1
+    corpus = corpus_m.group(1)
+    out_path = out_m.group(1)
+    workdir = os.path.dirname(out_path)
+    prompt_path = prompt_m.group(1)
+    expected_turns = int(turns_m.group(1))
     prompt = open(prompt_path, encoding="utf-8").read()
     n_chunks = len(markers)
-    print(f"\nprepared: {n_chunks} chunks, {n_msgs} synthetic msgs, workdir={workdir}")
+    print(f"\nprepared: {n_chunks} chunks, {n_msgs} synthetic msgs, "
+          f"expected_turns={expected_turns}, corpus={corpus}, workdir={workdir}")
     if n_chunks < 3:
-        print(f"FAIL: expected >=3 chunks to test multi-file reading, got {n_chunks}"); return 1
+        print(f"FAIL: expected >=3 chunks to test multi-file reading, got {n_chunks}")
+        return 1
+    if not os.path.isdir(corpus):
+        print(f"FAIL: immutable run corpus is missing: {corpus}")
+        return 1
 
     # 2) REAL codex reads the whole corpus and writes the style file
-    print(f"\nrunning real codex exec (this takes a while) …")
+    print("\nrunning real codex exec (this takes a while) …")
     t0 = time.time()
     cx = run([CODEX, "exec", "-C", workdir, "--skip-git-repo-check",
               "-s", "workspace-write",
@@ -97,19 +120,30 @@ def main():
     print("---- codex tail ----\n" + tail + "\n--------------------")
 
     # 3) verify: the style file exists and echoes back EVERY chunk marker
-    out_path = os.path.join(workdir, out_file)
     if not os.path.exists(out_path):
-        print(f"FAIL: {out_path} was not written"); return 1
+        print(f"FAIL: {out_path} was not written")
+        return 1
     style = open(out_path, encoding="utf-8").read()
-    found = [m for m in markers if m in style]
-    missing = [m for m in markers if m not in style]
+    lines = style.splitlines()
+    coverage_indexes = [i for i, line in enumerate(lines) if line.strip() == "## Coverage"]
+    coverage = lines[coverage_indexes[-1] + 1:] if coverage_indexes else []
+    found = [line.strip().removeprefix("CHUNK_ID=") for line in coverage
+             if line.strip().startswith("CHUNK_ID=")]
+    turn_claims = [line.strip().removeprefix("USER_TURNS_READ=") for line in coverage
+                   if line.strip().startswith("USER_TURNS_READ=")]
+    exact_markers = (len(found) == len(markers)
+                     and len(set(found)) == len(found)
+                     and set(found) == set(markers))
+    exact_turns = turn_claims == [str(expected_turns)]
+    missing = sorted(set(markers) - set(found))
     has_sections = sum(k.lower() in style.lower() for k in
                        ("voice", "tone", "feedback", "instruction", "coverage")) >= 3
     print(f"\nstyle file: {len(style)} chars, sections_ok={has_sections}")
-    print(f"markers covered: {len(found)}/{n_chunks}  missing={missing}")
-    ok = (len(missing) == 0) and has_sections
-    print("\n" + ("PASS — codex read the full corpus (all markers present)"
-                  if ok else "FAIL — incomplete read or thin summary"))
+    print(f"coverage markers={found} missing={missing} exact={exact_markers}")
+    print(f"turn claims={turn_claims} expected={expected_turns} exact={exact_turns}")
+    ok = exact_markers and exact_turns and has_sections
+    print("\n" + ("PASS — exact full-corpus Coverage contract satisfied"
+                  if ok else "FAIL — incomplete/duplicate/wrong Coverage or thin summary"))
     # leave ROOT for inspection on failure; clean on success
     if ok:
         shutil.rmtree(ROOT, ignore_errors=True)

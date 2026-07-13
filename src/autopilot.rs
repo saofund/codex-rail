@@ -1,6 +1,6 @@
 //! Autopilot: a per-session **pilot** — a real, visible codex session that rail
 //! drives to answer a *main* session on the user's behalf while it waits for
-//! input. Toggled with Space on the selected session.
+//! input. Toggled with Ctrl+A on the selected session.
 //!
 //! The pilot reads the user's distilled style plus the main session's latest
 //! message and writes the user's next reply; rail injects that reply back into
@@ -13,9 +13,10 @@
 
 use crate::protocol;
 use crate::state;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -33,11 +34,20 @@ fn default_cap() -> u32 {
 pub enum Phase {
     /// Watching the main session; fire when it completes a new turn.
     Idle,
+    /// Durable intent recorded immediately before creating a pilot session.
+    StartingPilot,
+    /// Durable intent recorded immediately before sending work to an existing
+    /// pilot. Recovery pauses rather than issuing the same nudge twice.
+    Nudging,
     /// Pilot is producing a reply; waiting for its turn to finish.
     Generating,
     /// Reply is ready; trying to inject it into the main session (retries if a
     /// human is attached and the worker refuses our headless client).
     Delivering,
+    /// The delivery intent was durably recorded immediately before injection.
+    /// Seeing this after a manager crash is ambiguous, so Rail hands control
+    /// back instead of risking a duplicate user message.
+    Injecting,
 }
 
 fn phase_idle() -> Phase {
@@ -45,9 +55,13 @@ fn phase_idle() -> Phase {
 }
 
 /// Persisted autopilot control for one main session.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AutopilotState {
     pub enabled: bool,
+    /// Marker semantics version. Missing in older state files (=0), which is
+    /// handled by pausing instead of replaying an ambiguous completed turn.
+    #[serde(default)]
+    pub marker_version: u8,
     #[serde(default)]
     pub pilot_id: Option<String>,
     #[serde(default)]
@@ -71,12 +85,20 @@ pub struct AutopilotState {
     /// Why autopilot paused/handed back (shown to the user).
     #[serde(default)]
     pub last_reason: Option<String>,
+    /// A disabled autopilot still owns its pilot until STOP + guardian cleanup
+    /// are verified. Keeping this durable link prevents a hung pilot becoming
+    /// an unowned ordinary session after restart.
+    #[serde(default)]
+    pub cleanup_pending: bool,
+    #[serde(default)]
+    pub phase_started_at: u64,
 }
 
 impl Default for AutopilotState {
     fn default() -> Self {
         AutopilotState {
             enabled: false,
+            marker_version: 2,
             pilot_id: None,
             replies: 0,
             cap: default_cap(),
@@ -85,7 +107,20 @@ impl Default for AutopilotState {
             pilot_marker: String::new(),
             pending_reply: String::new(),
             last_reason: None,
+            cleanup_pending: false,
+            phase_started_at: 0,
         }
+    }
+}
+
+impl AutopilotState {
+    pub fn enter_phase(&mut self, phase: Phase) {
+        self.phase = phase;
+        self.phase_started_at = if phase == Phase::Idle {
+            0
+        } else {
+            state::now_secs()
+        };
     }
 }
 
@@ -98,11 +133,10 @@ pub fn load(main_id: &str) -> Option<AutopilotState> {
     serde_json::from_str(&s).ok()
 }
 
-pub fn save(main_id: &str, st: &AutopilotState) {
+pub fn save(main_id: &str, st: &AutopilotState) -> Result<()> {
     let p = path(main_id);
-    if let Ok(bytes) = serde_json::to_vec_pretty(st) {
-        let _ = state::write_private_file(&p, bytes);
-    }
+    let bytes = serde_json::to_vec_pretty(st).context("serialize autopilot state")?;
+    state::write_private_file_atomic(&p, bytes)
 }
 
 pub fn remove(main_id: &str) {
@@ -113,25 +147,41 @@ pub fn remove(main_id: &str) {
 /// exactly the bytes a human would type. Returns `Ok(false)` when a human is
 /// already attached (the worker refuses a second client) so the caller can retry
 /// later; `Ok(true)` once delivered.
-pub fn inject(socket: &str, bytes: &[u8]) -> std::io::Result<bool> {
+pub fn inject(socket: &str, message: &str) -> std::io::Result<bool> {
     let mut stream = UnixStream::connect(socket)?;
-    write!(stream, "ATTACH 24 80\n")?;
+    write!(stream, "INJECT\n")?;
     stream.flush()?;
-    // The worker sends "already attached elsewhere" immediately (before any log
-    // tail) and drops us if a human holds the session.
-    stream
-        .set_read_timeout(Some(Duration::from_millis(250)))
-        .ok();
-    let mut buf = [0_u8; 512];
-    if let Ok(n) = stream.read(&mut buf) {
-        if n > 0 && String::from_utf8_lossy(&buf[..n]).contains("already attached") {
-            return Ok(false);
+    // Headless delivery has an explicit two-phase handshake.  Guessing from a
+    // partial log-tail read allowed a delayed/split BUSY response to look like
+    // success, silently dropping a reply while incrementing the durable count.
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    match protocol::read_line(&mut stream)?.as_str() {
+        "READY" => {}
+        "BUSY" => return Ok(false),
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unexpected injection handshake: {other:?}"),
+            ))
         }
     }
-    stream.set_read_timeout(None).ok();
-    protocol::write_input_frame(&mut stream, bytes)?;
-    // Let the worker forward to the PTY before we drop the client.
-    std::thread::sleep(Duration::from_millis(120));
+    let wire = protocol::bracketed_submission(message);
+    protocol::write_input_frame(&mut stream, &wire)?;
+    match protocol::read_line(&mut stream)?.as_str() {
+        "DELIVERED" => {}
+        "FAILED" => {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "worker could not write injection to the PTY",
+            ))
+        }
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unexpected injection acknowledgement: {other:?}"),
+            ))
+        }
+    }
     let _ = protocol::write_detach_frame(&mut stream);
     Ok(true)
 }
@@ -271,7 +321,10 @@ mod tests {
 
     #[test]
     fn parse_reply_sentinels_and_text() {
-        assert_eq!(parse_reply("  先查重，别急  "), Reply::Send("先查重，别急".to_string()));
+        assert_eq!(
+            parse_reply("  先查重，别急  "),
+            Reply::Send("先查重，别急".to_string())
+        );
         assert_eq!(parse_reply("[DONE]"), Reply::Done);
         assert_eq!(parse_reply("[DONE] task finished"), Reply::Done);
         match parse_reply("[HANDBACK] proposes rm -rf") {
@@ -281,7 +334,10 @@ mod tests {
         // empty -> handback, never an empty send
         assert!(matches!(parse_reply("   "), Reply::HandBack(_)));
         // leaked sentinel mid-text -> handback, not a malformed send
-        assert!(matches!(parse_reply("sure, go ahead [HANDBACK] wait"), Reply::HandBack(_)));
+        assert!(matches!(
+            parse_reply("sure, go ahead [HANDBACK] wait"),
+            Reply::HandBack(_)
+        ));
     }
 
     #[test]
@@ -289,6 +345,19 @@ mod tests {
         assert!(AutopilotState::default().cap >= 1);
         assert!(!AutopilotState::default().enabled);
         assert_eq!(AutopilotState::default().phase, Phase::Idle);
+    }
+
+    #[test]
+    fn injecting_phase_survives_restart_for_duplicate_suppression() {
+        let mut state = AutopilotState::default();
+        state.enabled = true;
+        state.marker_version = 2;
+        state.phase = Phase::Injecting;
+        state.pending_reply = "send exactly once".to_string();
+        let encoded = serde_json::to_vec(&state).unwrap();
+        let decoded: AutopilotState = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.phase, Phase::Injecting);
+        assert_eq!(decoded.pending_reply, "send exactly once");
     }
 
     #[test]

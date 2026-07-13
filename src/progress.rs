@@ -43,7 +43,11 @@ pub fn fill(width: u16, fraction: f64) -> Fill {
     let eighths = (frac * width as f64 * 8.0).round() as u32;
     let full = (eighths / 8) as u16;
     let rem = (eighths % 8) as usize;
-    let partial = if rem == 0 { None } else { Some(EIGHTHS[rem - 1]) };
+    let partial = if rem == 0 {
+        None
+    } else {
+        Some(EIGHTHS[rem - 1])
+    };
     let used = full + partial.is_some() as u16;
     Fill {
         full,
