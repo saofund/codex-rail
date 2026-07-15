@@ -25,8 +25,10 @@ static UPDATE_THREAD_LOCK: Mutex<()> = Mutex::new(());
 static UPDATE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // Keep an exact, cheaply inspectable build identity in every release asset. The
-// updater verifies this marker against main before it replaces the current
-// binary, so a still-publishing/stale rolling release is rejected.
+// updater verifies this marker against the RELEASE's own sha (the commit the
+// rolling `latest` tag points at) before it replaces the current binary, so a
+// half-uploaded/mismatched asset is rejected while a release that merely lags
+// main still installs.
 #[used]
 static RAIL_BUILD_SHA_MARKER: &str =
     concat!("CODEX_RAIL_BUILD_SHA=", env!("RAIL_GIT_SHA_FULL"), "\n");
@@ -107,14 +109,85 @@ fn validate_git_sha(sha: &str) -> Result<()> {
     Ok(())
 }
 
-fn latest_main_sha_full() -> Result<String> {
-    let v = api_json("commits/main").context("fetch latest main commit")?;
+/// Resolve a git ref (branch, tag, or sha) to its full commit sha.
+fn resolve_ref_sha_full(git_ref: &str) -> Result<String> {
+    let v = api_json(&format!("commits/{git_ref}"))
+        .with_context(|| format!("resolve git ref {git_ref}"))?;
     let sha = v
         .get("sha")
         .and_then(|s| s.as_str())
-        .context("latest main response has no commit sha")?;
+        .context("commit response has no sha")?;
     validate_git_sha(sha)?;
     Ok(sha.to_ascii_lowercase())
+}
+
+/// GitHub's ahead/behind status of the release relative to the running build.
+fn compare_status_to_release(mine: &str, release_sha: &str) -> Result<String> {
+    let v = api_json(&format!("compare/{mine}...{release_sha}"))
+        .context("compare the running build with the latest release")?;
+    v.get("status")
+        .and_then(|s| s.as_str())
+        .map(|s| s.to_string())
+        .context("compare response has no status")
+}
+
+/// How the rolling `latest` release relates to the running build.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReleaseDecision {
+    /// The release is strictly ahead of us; the value is its full commit sha.
+    Newer(String),
+    /// Identical, we are ahead (a dev build past the last CI publish), or the
+    /// two lines diverged — nothing to install and nothing to advertise.
+    NotNewer,
+    /// No embedded sha (unversioned local build) or the comparison failed.
+    Unknown,
+}
+
+/// Decide, from the running sha, the release sha, and GitHub's compare status,
+/// whether the release is a genuine upgrade. Pure so every branch is unit-tested.
+///
+/// This replaces the old "any sha difference == newer, and the download must
+/// match `main` HEAD" logic, which had two real bugs: a rolling release that
+/// merely LAGGED main failed every install (marker != main HEAD), and a local
+/// build AHEAD of the last publish nagged to "update" (i.e. silently downgrade).
+/// Requiring GitHub's `ahead` status fixes both.
+fn classify_release(mine: &str, release_sha: &str, compare_status: &str) -> ReleaseDecision {
+    let mine = mine.trim().to_ascii_lowercase();
+    if mine.is_empty() || mine == "unknown" || validate_git_sha(&mine).is_err() {
+        return ReleaseDecision::Unknown;
+    }
+    let release = release_sha.trim().to_ascii_lowercase();
+    if validate_git_sha(&release).is_err() {
+        return ReleaseDecision::Unknown;
+    }
+    if release == mine {
+        return ReleaseDecision::NotNewer;
+    }
+    match compare_status {
+        // `status` is head-relative-to-base (base = our build): only "ahead"
+        // means the release contains commits we lack. "behind" (we are ahead — a
+        // dev build), "identical", and "diverged" must never offer or install.
+        "ahead" => ReleaseDecision::Newer(release),
+        _ => ReleaseDecision::NotNewer,
+    }
+}
+
+/// Query GitHub for how the rolling `latest` release compares to this build.
+fn release_decision() -> ReleaseDecision {
+    let mine = build_sha_full().to_ascii_lowercase();
+    if mine == "unknown" {
+        return ReleaseDecision::Unknown;
+    }
+    let Ok(release) = resolve_ref_sha_full("latest") else {
+        return ReleaseDecision::Unknown;
+    };
+    if release == mine {
+        return ReleaseDecision::NotNewer;
+    }
+    let Ok(status) = compare_status_to_release(&mine, &release) else {
+        return ReleaseDecision::Unknown;
+    };
+    classify_release(&mine, &release, &status)
 }
 
 fn short_sha(sha: &str) -> Result<String> {
@@ -122,25 +195,35 @@ fn short_sha(sha: &str) -> Result<String> {
     Ok(sha.chars().take(7).collect())
 }
 
-/// If a newer build than this one is available, the newer short sha; else None.
+/// If the rolling `latest` release is strictly newer than this build, its short
+/// sha; else None. A local build EQUAL TO or AHEAD OF the last publish (the
+/// common dev case) returns None — no phantom "update available" note.
 pub fn newer_available() -> Option<String> {
-    let latest_full = latest_main_sha_full().ok()?;
-    let mine = build_sha_full().to_ascii_lowercase();
-    if mine != "unknown" && latest_full != mine {
-        short_sha(&latest_full).ok()
-    } else {
-        None
+    match release_decision() {
+        ReleaseDecision::Newer(sha) => short_sha(&sha).ok(),
+        ReleaseDecision::NotNewer | ReleaseDecision::Unknown => None,
     }
 }
 
 /// Download the latest release binary for this platform and atomically replace
 /// the running executable (Linux/macOS let you rename over a running file; the
 /// live process keeps the old inode, the next launch picks up the new one).
-/// Errors clearly if no Release/asset exists yet (CI publishes them on push).
+/// Refuses to downgrade: installs only when the release is genuinely ahead, and
+/// validates the download's embedded marker against the RELEASE's sha (not main
+/// HEAD), so a rolling release that lags main still installs cleanly instead of
+/// failing every time.
 pub fn apply() -> Result<String> {
     let exe = current_executable_for_update()?;
     let _guard = acquire_update_lock(&exe)?;
-    let expected_sha = latest_main_sha_full()?;
+    let expected_sha = match release_decision() {
+        ReleaseDecision::Newer(sha) => sha,
+        ReleaseDecision::NotNewer => bail!(
+            "already up to date — the running build is current with (or newer than) the latest published release"
+        ),
+        ReleaseDecision::Unknown => bail!(
+            "cannot determine the latest release (no network reachable, or this is an unversioned local build)"
+        ),
+    };
     let rel =
         api_json("releases/latest").context("fetch latest release (has CI published one yet?)")?;
     let tag = rel
@@ -434,6 +517,60 @@ mod tests {
         assert!(validate_download(&fake_executable("7654321"), "1234567").is_err());
         assert!(validate_download(&fake_executable("12345670"), "1234567").is_err());
         assert!(validate_download(&fake_executable("1234567"), "1234567").is_ok());
+    }
+
+    #[test]
+    fn classify_release_only_upgrades_when_the_release_is_strictly_ahead() {
+        let mine = "0123456789abcdef0123456789abcdef01234567";
+        let release = "89abcdef0123456789abcdef0123456789abcdef";
+
+        // The release has commits we lack -> a genuine upgrade.
+        assert_eq!(
+            classify_release(mine, release, "ahead"),
+            ReleaseDecision::Newer(release.to_string())
+        );
+
+        // THE BUG THIS FIXES: our build is AHEAD of the last CI publish (the
+        // rolling release lags main). The old code saw "different sha" and both
+        // nagged and, on click, downgraded. Now every non-"ahead" status is inert.
+        assert_eq!(
+            classify_release(mine, release, "behind"),
+            ReleaseDecision::NotNewer
+        );
+        assert_eq!(
+            classify_release(mine, release, "diverged"),
+            ReleaseDecision::NotNewer
+        );
+        assert_eq!(
+            classify_release(mine, release, "identical"),
+            ReleaseDecision::NotNewer
+        );
+
+        // Same sha is up to date regardless of the (never-"ahead") status.
+        assert_eq!(
+            classify_release(mine, mine, "ahead"),
+            ReleaseDecision::NotNewer
+        );
+
+        // Case-insensitive sha match still counts as identical.
+        assert_eq!(
+            classify_release(mine, &mine.to_ascii_uppercase(), "ahead"),
+            ReleaseDecision::NotNewer
+        );
+
+        // An unversioned local build, or a garbage release sha, is never acted on.
+        assert_eq!(
+            classify_release("unknown", release, "ahead"),
+            ReleaseDecision::Unknown
+        );
+        assert_eq!(
+            classify_release("", release, "ahead"),
+            ReleaseDecision::Unknown
+        );
+        assert_eq!(
+            classify_release(mine, "not-a-real-sha", "ahead"),
+            ReleaseDecision::Unknown
+        );
     }
 
     #[test]
