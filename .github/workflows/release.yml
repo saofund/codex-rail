@@ -6,19 +6,56 @@ name: release
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: release
-  cancel-in-progress: true
+  # PR quality runs may supersede themselves. A release never may: cancelling
+  # while assets are being replaced can leave the rolling release half-updated.
+  group: ${{ github.event_name == 'pull_request' && format('quality-pr-{0}', github.event.pull_request.number) || 'release' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  quality:
+    name: quality gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RUSTFLAGS: -Dwarnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install cockpit dependencies
+        run: python -m pip install --requirement tests/requirements.txt
+      - name: Check
+        run: cargo check --locked --all-targets
+      - name: Test
+        run: cargo test --locked --all-targets -- --test-threads=1
+      - name: Build cockpit binary
+        run: cargo build --release --locked
+      - name: Run cockpit audit
+        run: python tests/cockpit.py ./target/release/rail --png artifacts/cockpit
+      - name: Upload cockpit PNGs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cockpit-png-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/cockpit
+          if-no-files-found: warn
+
   build:
     name: build ${{ matrix.asset }}
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: quality
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: -Dwarnings
     strategy:
       fail-fast: false
       matrix:
@@ -28,15 +65,9 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             asset: rail-x86_64-linux
-          - os: ubuntu-latest
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             asset: rail-aarch64-linux
-          # macOS: Apple Silicon covers every Mac since 2020. (Intel /
-          # x86_64-apple-darwin on macos-13 is omitted — those runners are scarce
-          # and queue for ages; add it back if an Intel-Mac user needs it.)
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            asset: rail-aarch64-macos
     steps:
       - uses: actions/checkout@v4
       - name: Install rust target
@@ -47,14 +78,22 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
-            sudo apt-get install -y gcc-aarch64-linux-gnu
-            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
-            echo "CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc" >> "$GITHUB_ENV"
+            echo "CC_aarch64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
           fi
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Stage asset
         run: cp "target/${{ matrix.target }}/release/rail" "${{ matrix.asset }}"
+      - name: Smoke staged asset
+        shell: bash
+        run: |
+          file "${{ matrix.asset }}"
+          if [[ "${{ matrix.target }}" == *-linux-musl ]]; then
+            file "${{ matrix.asset }}" | grep -Eq 'statically linked|static-pie linked'
+          fi
+          "./${{ matrix.asset }}" --version | grep -q '^rail '
+          grep -aFq -- "CODEX_RAIL_BUILD_SHA=${GITHUB_SHA}" "${{ matrix.asset }}"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
@@ -63,17 +102,48 @@ jobs:
 
   publish:
     name: publish latest release
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
+          pattern: rail-*
           path: dist
           merge-multiple: true
-      - name: List artifacts
-        run: ls -la dist
+      - name: Verify complete artifact set
+        run: |
+          test -f dist/rail-x86_64-linux
+          test -f dist/rail-aarch64-linux
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 2
+          ls -la dist
+      - name: Remove unsupported legacy release assets
+        uses: actions/github-script@v7
+        with:
+          script: |
+            try {
+              const {data: release} = await github.rest.repos.getReleaseByTag({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag: "latest",
+              });
+              for (const asset of release.assets) {
+                if (asset.name === "rail-aarch64-macos") {
+                  await github.rest.repos.deleteReleaseAsset({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    asset_id: asset.id,
+                  });
+                }
+              }
+            } catch (error) {
+              // A first-ever publish has no rolling release yet. Any other API
+              // failure must stop publication rather than leave stale assets.
+              if (error.status !== 404) throw error;
+            }
       - name: Publish rolling 'latest' release
         uses: softprops/action-gh-release@v2
         with:
@@ -83,4 +153,6 @@ jobs:
           files: dist/*
           body: |
             Rolling build of the latest `main`. `rail update` fetches the binary
-            for your platform (rail-<arch>-<os>).
+            for supported Linux platforms (rail-<arch>-linux). macOS is not
+            published because its forced-cleanup path lacks Linux-equivalent
+            process-generation verification.

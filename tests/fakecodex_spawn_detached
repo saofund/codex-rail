@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+"""Fake Codex with a TERM-resistant descendant in its own session/process group."""
+
+import os
+import signal
+import sys
+import time
+
+
+pid_file = os.environ["CODEX_RAIL_DETACHED_PIDS"]
+detached = os.fork()
+if detached == 0:
+    os.setsid()
+    for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, signal.SIG_IGN)
+    with open(pid_file, "a", encoding="utf-8") as out:
+        out.write(f"{os.getpid()} {os.getpgrp()} {os.getsid(0)}\n")
+        out.flush()
+    while True:
+        signal.pause()
+
+if os.environ.get("CODEX_RAIL_DETACHED_ROOT_MODE") == "exit":
+    # Ensure the adversarial child has published its identity before the direct
+    # Codex exits successfully and the worker takes its natural ChildExit path.
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline and not os.path.exists(pid_file):
+        time.sleep(0.01)
+    sys.exit(0)
+
+# Make rail exercise its SIGKILL grace path for the direct child as well.
+for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+    signal.signal(sig, signal.SIG_IGN)
+while True:
+    signal.pause()

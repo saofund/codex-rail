@@ -1,0 +1,6 @@
+#!/bin/sh
+# Quiet stand-in for codex: stay alive until rail stops it.
+if [ -n "${CODEX_RAIL_FAKE_COUNT:-}" ]; then
+    printf '%s\n' "$$" >> "$CODEX_RAIL_FAKE_COUNT"
+fi
+exec sleep 3600

@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""Fake Codex TUI that exposes early/blind initial-prompt injection."""
+
+import json
+import os
+import sys
+import time
+import tty
+
+
+record_path = os.environ["CODEX_RAIL_PROMPT_RECORD"].replace("{pid}", str(os.getpid()))
+mode = os.environ.get("CODEX_RAIL_PROMPT_MODE", "ready")
+fd = sys.stdin.fileno()
+tty.setraw(fd)
+os.set_blocking(fd, False)
+
+record = {
+    "pid": os.getpid(),
+    "argv": sys.argv[1:],
+    "early_hex": "",
+    "payload": None,
+    "framed": False,
+    "ready_emitted": False,
+    "composer_emitted": False,
+    "wire_hex": "",
+    "extra_hex": "",
+    "postcheck_done": False,
+}
+
+
+def persist():
+    tmp = f"{record_path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as out:
+        json.dump(record, out, ensure_ascii=False)
+    os.replace(tmp, record_path)
+
+
+def read_available():
+    chunks = []
+    while True:
+        try:
+            chunk = os.read(fd, 65536)
+        except BlockingIOError:
+            break
+        if not chunk:
+            break
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+persist()
+os.write(sys.stdout.fileno(), b"\x1b[?2004h")
+record["ready_emitted"] = True
+persist()
+
+# Enabling bracketed paste is not enough: Codex can do that before its composer
+# exists. A blind fixed sleep loses this race, so consume and record every byte
+# that reaches stdin before the UTF-8 composer marker appears.
+early = bytearray()
+composer_at = time.monotonic() + 0.70
+while time.monotonic() < composer_at:
+    early.extend(read_available())
+    if early:
+        record["early_hex"] = bytes(early).hex()
+        persist()
+    time.sleep(0.02)
+
+if mode == "never":
+    # Stay alive with bracketed paste enabled but no composer. Rail owns the
+    # readiness timeout and must fail/stop this process itself.
+    while True:
+        early.extend(read_available())
+        if early:
+            record["early_hex"] = bytes(early).hex()
+            persist()
+        time.sleep(0.02)
+
+os.write(sys.stdout.fileno(), "›".encode("utf-8"))
+record["composer_emitted"] = True
+persist()
+
+received = bytearray()
+deadline = time.monotonic() + 8.0
+while time.monotonic() < deadline:
+    received.extend(read_available())
+    if b"\x1b[201~\r" in received:
+        break
+    time.sleep(0.02)
+
+prefix = b"\x1b[200~"
+suffix = b"\x1b[201~\r"
+wire = bytes(received)
+record["wire_hex"] = wire.hex()
+record["framed"] = wire.startswith(prefix) and wire.endswith(suffix)
+if record["framed"]:
+    record["payload"] = wire[len(prefix):-len(suffix)].decode("utf-8", errors="replace")
+persist()
+
+if record["framed"]:
+    os.write(sys.stdout.fileno(), b"tick prompt accepted\r\n")
+    extra = bytearray()
+    postcheck_deadline = time.monotonic() + 1.0
+    while time.monotonic() < postcheck_deadline:
+        extra.extend(read_available())
+        time.sleep(0.02)
+    record["extra_hex"] = bytes(extra).hex()
+record["postcheck_done"] = True
+persist()
+while True:
+    time.sleep(3600)

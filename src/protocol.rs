@@ -52,6 +52,39 @@ pub fn write_input_frame(stream: &mut UnixStream, bytes: &[u8]) -> io::Result<()
     stream.flush()
 }
 
+pub fn sanitize_submission_text(message: &str) -> String {
+    message
+        .chars()
+        .filter(|c| {
+            let value = *c as u32;
+            *c == '\n'
+                || *c == '\t'
+                || !matches!(
+                    value,
+                    0x0000..=0x001f
+                        | 0x007f..=0x009f
+                        | 0x200b..=0x200c
+                        | 0x200e..=0x200f
+                        | 0x202a..=0x202e
+                        | 0x2060..=0x2069
+                        | 0xfeff
+                )
+        })
+        .collect()
+}
+
+/// One logical multiline composer submission. Bracketed paste prevents embedded
+/// newlines from becoming separate Enter keypresses; sanitization prevents a
+/// model/user string from closing the paste or synthesizing terminal controls.
+pub fn bracketed_submission(message: &str) -> Vec<u8> {
+    let safe = sanitize_submission_text(message);
+    let mut wire = Vec::with_capacity(safe.len() + 16);
+    wire.extend_from_slice(b"\x1b[200~");
+    wire.extend_from_slice(safe.as_bytes());
+    wire.extend_from_slice(b"\x1b[201~\r");
+    wire
+}
+
 pub fn write_resize_frame(stream: &mut UnixStream, rows: u16, cols: u16) -> io::Result<()> {
     stream.write_all(&[FRAME_RESIZE])?;
     stream.write_all(&rows.to_be_bytes())?;
@@ -116,5 +149,23 @@ fn read_exact_or_eof<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<bool
         Ok(()) => Ok(true),
         Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
         Err(err) => Err(err),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bracketed_submission, sanitize_submission_text};
+
+    #[test]
+    fn logical_submission_preserves_multiline_unicode_and_blocks_control_injection() {
+        let message = "第一行\n\tsecond 👩‍💻\u{1b}[201~evil\u{202e}";
+        assert_eq!(
+            sanitize_submission_text(message),
+            "第一行\n\tsecond 👩‍💻[201~evil"
+        );
+        assert_eq!(
+            bracketed_submission(message),
+            "\u{1b}[200~第一行\n\tsecond 👩‍💻[201~evil\u{1b}[201~\r".as_bytes()
+        );
     }
 }
