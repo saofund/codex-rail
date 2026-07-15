@@ -542,6 +542,27 @@ fn run_worker_inner(id: &str, subreaper_enabled: bool) -> Result<()> {
             }
             Some(WorkerEvent::ChildExit(outcome)) => {
                 run_guard.note_root_exited();
+                // Drain the child's final PTY output into the log before
+                // finishing. rx (control) is polled before pty_rx, so ChildExit
+                // can arrive with the last chunk — e.g. a startup error line —
+                // still queued or in flight. Losing it both truncated the
+                // transcript tail and hid the failure reason. Bounded: drain
+                // until 50ms of quiet, capped at 300ms (child exit is not a hot
+                // path), so a wedged reader can't stall teardown.
+                let drain_deadline = Instant::now() + Duration::from_millis(300);
+                loop {
+                    let now = Instant::now();
+                    if now >= drain_deadline {
+                        break;
+                    }
+                    match pty_rx.recv_timeout(Duration::from_millis(50).min(drain_deadline - now)) {
+                        Ok(bytes) => {
+                            let _ = log.write_all(&bytes);
+                        }
+                        Err(_) => break,
+                    }
+                }
+                log.flush().ok();
                 let report = run_guard.terminate(Duration::from_secs(1), Duration::from_secs(2));
                 return finish_run(
                     &mut session,
@@ -895,12 +916,17 @@ fn fail_run(
     }
 }
 
+// A codex that dies within this window of session creation failed at startup,
+// so its last log line is its error message rather than a mid-run TUI redraw.
+const STARTUP_HINT_SECS: u64 = 60;
+
 fn finish_run(
     session: &mut SessionState,
     report: CleanupReport,
     cause: FinishCause,
     socket_identity: (u64, u64),
 ) -> Result<()> {
+    let child_failed = matches!(&cause, FinishCause::Natural(outcome) if !outcome.success);
     let disposition = classify_finish(report, cause);
     let prompt_delivery_uncertain = session.initial_prompt_injecting;
     session.updated_at = state::now_secs();
@@ -910,14 +936,26 @@ fn finish_run(
         disposition.status.to_string()
     };
     session.exit_code = disposition.exit_code;
+    // On a quick startup failure a bare "codex exited with status N" hides the
+    // reason (a too-old codex 400s the model, a bad config, a trust prompt).
+    // Append codex's own last log line so the failure is legible in the list.
+    let mut base_error = disposition.last_error;
+    if child_failed && state::now_secs().saturating_sub(session.created_at) <= STARTUP_HINT_SECS {
+        if let Some(hint) = codex_failure_hint(&session.id) {
+            base_error = Some(match base_error {
+                Some(error) => format!("{error}: {hint}"),
+                None => format!("codex reported: {hint}"),
+            });
+        }
+    }
     session.last_error = if prompt_delivery_uncertain {
         let warning = "initial prompt delivery was interrupted and may have been submitted";
-        Some(match disposition.last_error {
+        Some(match base_error {
             Some(error) => format!("{warning}; {error}"),
             None => warning.to_string(),
         })
     } else {
-        disposition.last_error
+        base_error
     };
     session.worker_pid = None;
     session.initial_prompt = if prompt_delivery_uncertain {
@@ -1196,6 +1234,78 @@ fn clean_tail_start(buf: &[u8], started_midfile: bool) -> &[u8] {
         Some(nl) => &buf[nl + 1..],
         None => buf,
     }
+}
+
+// Remove ANSI/VT escape sequences (CSI `ESC [ … final`, OSC `ESC ] … BEL/ST`,
+// and any lone `ESC x`) so a TUI-colored line collapses to plain text.
+fn strip_terminal_sequences(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            // CSI: consume params/intermediates up to a final byte 0x40..=0x7e.
+            Some('[') => {
+                for n in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&n) {
+                        break;
+                    }
+                }
+            }
+            // OSC: consume up to BEL, or ST (`ESC \`).
+            Some(']') => {
+                while let Some(n) = chars.next() {
+                    if n == '\u{7}' {
+                        break;
+                    }
+                    if n == '\u{1b}' {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            // Lone ESC or a two-char escape: drop the escape itself.
+            _ => {}
+        }
+    }
+    out
+}
+
+// The last human-readable line of a captured PTY log, ANSI/control stripped.
+// codex prints a plain error (e.g. "model X requires a newer version of Codex")
+// before its TUI starts, so on a startup failure this surfaces WHY the session
+// died instead of a bare exit status. Pure so the extraction is unit-tested.
+fn hint_from_log_bytes(bytes: &[u8]) -> Option<String> {
+    strip_terminal_sequences(bytes)
+        .lines()
+        .rev()
+        .map(|line| protocol::sanitize_submission_text(line).trim().to_string())
+        .find(|line| line.chars().any(|c| c.is_alphabetic()))
+        .map(|line| line.chars().take(200).collect::<String>())
+        .filter(|line| !line.is_empty())
+}
+
+// Read the tail of a session's PTY log and return its last readable line.
+fn codex_failure_hint(id: &str) -> Option<String> {
+    let path = state::log_path(id);
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(TAIL_BYTES as u64);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).ok()?;
+    hint_from_log_bytes(&buf)
 }
 
 fn spawn_pty_reader(
@@ -1530,8 +1640,8 @@ enum WorkerEvent {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_finish, clean_tail_start, compact_output_log, write_initial_prompt, ChildOutcome,
-        FinishCause, RolloutLifecycle, TuiReadiness,
+        classify_finish, clean_tail_start, compact_output_log, hint_from_log_bytes,
+        write_initial_prompt, ChildOutcome, FinishCause, RolloutLifecycle, TuiReadiness,
     };
     use crate::process_tree::CleanupReport;
     use crate::state::{STATUS_EXITED, STATUS_FAILED};
@@ -1555,6 +1665,32 @@ mod tests {
         );
         // mid-file, newline only at the very end: nothing clean to show
         assert_eq!(clean_tail_start(b"partial\n", true), b"");
+    }
+
+    #[test]
+    fn codex_failure_hint_surfaces_the_last_readable_line() {
+        // A colored startup error, cursor moves, and trailing blank lines: the
+        // reason must survive with ANSI/control bytes gone (so a version failure
+        // reads as its message, not "codex exited with status 1").
+        let log = b"\x1b[2J\x1b[H\x1b[1;31mError: model gpt-5.6-sol requires a newer \
+                    version of Codex (>= 0.143.0)\x1b[0m\r\n\r\n";
+        let hint = hint_from_log_bytes(log).expect("a readable error line");
+        assert!(
+            hint.contains("requires a newer version of Codex"),
+            "got: {hint:?}"
+        );
+        assert!(!hint.contains('\u{1b}'), "escape survived: {hint:?}");
+        assert!(!hint.contains("[31m") && !hint.contains("[0m"));
+
+        // An OSC title sequence is stripped; the real text is kept.
+        assert_eq!(
+            hint_from_log_bytes(b"\x1b]0;codex\x07ready to go\n").as_deref(),
+            Some("ready to go")
+        );
+
+        // Nothing but clears/whitespace yields no hint, so we never append junk.
+        assert_eq!(hint_from_log_bytes(b"\x1b[2J\x1b[H\r\n \t \r\n"), None);
+        assert_eq!(hint_from_log_bytes(b""), None);
     }
 
     #[test]

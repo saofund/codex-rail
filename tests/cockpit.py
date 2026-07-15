@@ -44,6 +44,7 @@ FAKE_STREAM = os.path.join(HERE, "fakecodex")            # streams "tick" foreve
 FAKE_SLEEP = os.path.join(HERE, "fakecodex_sleep")       # quiet long-lived child
 FAKE_DETACHED = os.path.join(HERE, "fakecodex_spawn_detached")
 FAKE_PROMPT_TUI = os.path.join(HERE, "fakecodex_prompt_tui")
+FAKE_STARTUP_ERROR = os.path.join(HERE, "fakecodex_startup_error")  # prints a version error, exits 1
 
 COLS, ROWS = 110, 40
 
@@ -1671,6 +1672,34 @@ def audit(rail, pngdir=None):
         preserved = os.path.isfile(socket_path) and open(socket_path).read() == "do not delete"
         check("worker setup failure: non-socket path is preserved and reported",
               visible and preserved, f"visible={visible} preserved={preserved} state={after.get('status')}")
+    finally:
+        c.close()
+
+    # 29b) A codex that dies at STARTUP (e.g. a too-old codex 400s the model)
+    #      must surface codex's OWN error in the session's last_error, not just a
+    #      bare "codex exited with status 1". This is the failure that made a
+    #      wrong-version codex look like an unexplained, repeatedly-triggered bug.
+    c = Cockpit(rail, codex=FAKE_STARTUP_ERROR).boot()
+    try:
+        c.seed("boom-0", "BOOMSESSION", status="starting", codex=FAKE_STARTUP_ERROR)
+        c.start_guardian("boom-0", FAKE_STARTUP_ERROR)
+
+        def boom_state():
+            try:
+                return json.load(open(f"{c.jobs}/boom-0/state.json"))
+            except (FileNotFoundError, ValueError):
+                return {}
+
+        failed = c.wait_until(lambda: boom_state().get("status") == "failed", timeout=10)
+        st = boom_state()
+        err = st.get("last_error") or ""
+        reason_visible = "requires a newer version of Codex" in err
+        # the surfaced reason must be plain text — no ANSI escape / SGR leftovers
+        ansi_free = "\x1b" not in err and "[31m" not in err and "[0m" not in err
+        check("codex startup failure surfaces codex's own error, not a bare exit code",
+              failed and reason_visible and ansi_free,
+              f"failed={failed} status={st.get('status')!r} reason={reason_visible} "
+              f"ansi_free={ansi_free} err={err!r}")
     finally:
         c.close()
 
