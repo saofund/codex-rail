@@ -22,7 +22,16 @@ fn main() {
         .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=RAIL_GIT_SHA={short_sha}");
     println!("cargo:rustc-env=RAIL_GIT_SHA_FULL={full_sha}");
-    // Rebuild when HEAD moves so the embedded sha stays current.
+    // Rebuild when the checked-out commit moves so the embedded sha stays
+    // current — on WHATEVER branch is checked out. The old code hard-coded
+    // refs/heads/main, so a commit on any other branch (e.g. a feature branch)
+    // left `rail --version` reporting a stale sha. Watch HEAD, packed-refs, and
+    // the specific ref HEAD points at.
     println!("cargo:rerun-if-changed=.git/HEAD");
-    println!("cargo:rerun-if-changed=.git/refs/heads/main");
+    println!("cargo:rerun-if-changed=.git/packed-refs");
+    if let Ok(head) = std::fs::read_to_string(".git/HEAD") {
+        if let Some(reference) = head.strip_prefix("ref:").map(str::trim) {
+            println!("cargo:rerun-if-changed=.git/{reference}");
+        }
+    }
 }
